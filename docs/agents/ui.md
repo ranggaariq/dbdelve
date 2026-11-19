@@ -239,6 +239,10 @@ curves, and hover states are instant. These things move:
   at `form_entrance_ms`, and `reduce_motion` skips it. Its SSH and AWS SSM rows settle in
   once over 220ms when the tunnel is switched on (`revealed`, keyed by the
   transport and row, so switching transports replays the entrance). Neither repeats.
+- **The keycast badge** (`workspace/keycast.rs`) fades in once over 150ms, keyed
+  by the flash's sequence, so a new chord remounts and replays it. The dismissal
+  is a one-shot timer with a sequence guard, not a tick; `reduce_motion` skips
+  it; it never repeats.
 
 Anything else that moves needs raising first, and a second repeating animation
 means building the shared throttled clock and moving both onto it.

@@ -717,6 +717,10 @@ pub struct StoredSettings {
     /// at all. Absent reads as on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_show_sizes: Option<bool>,
+    /// Whether the keycast badge flashes the shortcut just fired. Absent
+    /// reads as on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortcut_badge: Option<bool>,
     /// Keybinding overrides, keyed by the action id in
     /// `keybindings::REGISTRY`. Only the ones a user actually changed --
     /// everything else stays on whatever the running build defaults to.
@@ -4687,6 +4691,7 @@ open_objects = []
                 sidebar_density: Some("compact".into()),
                 sidebar_show_host: Some(false),
                 sidebar_show_sizes: Some(false),
+                shortcut_badge: Some(false),
                 custom_keybindings: Some(HashMap::from([(
                     "apply_edits".to_string(),
                     "cmd-shift-s".to_string(),
