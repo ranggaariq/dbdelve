@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use gpui::{KeyBinding, Keystroke};
+use gpui::{Action, KeyBinding, Keystroke};
 
 use gpui_component::input::ShowCompletions;
 
@@ -135,10 +135,29 @@ macro_rules! registry_binding {
     };
 }
 
+// `registry_binding!`'s sibling: the same action literal, spelled as a test
+// against a dispatched action. `partial_eq`, not `TypeId` -- several rows
+// share one action type and differ only by payload, so `SetMode { mode }`
+// has to match its own row and no other.
+macro_rules! registry_matcher {
+    (($id:literal, $label:literal, $context:expr, [$($default:literal),*], @macos, $($action:tt)+)) => {
+        |action: &dyn Action| action.partial_eq(&($($action)+))
+    };
+    (($id:literal, $label:literal, $context:expr, [$($default:literal),*], $($action:tt)+)) => {
+        |action: &dyn Action| action.partial_eq(&($($action)+))
+    };
+}
+
 macro_rules! registry {
     ($(($($entry:tt)+)),* $(,)?) => {
         pub(crate) const REGISTRY: &[KeybindingSpec] = &[
             $(registry_spec!(($($entry)+))),*
+        ];
+
+        /// One matcher per [`REGISTRY`] row, in its order: whether a
+        /// dispatched action is that row's.
+        const MATCHERS: &[fn(&dyn Action) -> bool] = &[
+            $(registry_matcher!(($($entry)+))),*
         ];
 
         /// Every `KeyBinding` GPUI should register at startup: a user's
@@ -149,6 +168,16 @@ macro_rules! registry {
                 registry_binding!(($($entry)+), overrides, bindings);
             )*
             bindings
+        }
+
+        /// The registry row a dispatched action belongs to, if any. What the
+        /// keycast badge reads: the row's label and, through
+        /// [`chords_for`], the chord to show.
+        pub(crate) fn registry_entry(action: &dyn Action) -> Option<&'static KeybindingSpec> {
+            REGISTRY
+                .iter()
+                .zip(MATCHERS)
+                .find_map(|(spec, matches)| matches(action).then_some(spec))
         }
     };
 }
@@ -626,5 +655,51 @@ mod tests {
             conflict("secondary-enter", None, "run_query", &overrides),
             None
         );
+    }
+
+    #[test]
+    fn a_dispatched_action_finds_its_registry_row() {
+        assert_eq!(
+            registry_entry(&RunQuery).map(|spec| spec.id),
+            Some("run_query")
+        );
+    }
+
+    #[test]
+    fn the_matcher_tells_payloads_of_one_action_type_apart() {
+        // Three rows share `SetMode`; only the payload picks one out.
+        assert_eq!(
+            registry_entry(&SetMode {
+                mode: Mode::ReadWrite
+            })
+            .map(|spec| spec.id),
+            Some("set_mode_read_write")
+        );
+        assert_eq!(
+            registry_entry(&SetMode {
+                mode: Mode::ReadOnly
+            })
+            .map(|spec| spec.id),
+            Some("set_mode_read_only")
+        );
+        // The same for `CopyRows` and `ExplainQuery { mode }`.
+        assert_eq!(
+            registry_entry(&CopyRows { kind: RowsAs::Csv }).map(|spec| spec.id),
+            Some("copy_rows_csv")
+        );
+        assert_eq!(
+            registry_entry(&ExplainQuery {
+                mode: ExplainMode::Plan
+            })
+            .map(|spec| spec.id),
+            Some("explain_query")
+        );
+    }
+
+    #[test]
+    fn an_action_outside_the_registry_matches_no_row() {
+        // A library action on a cell input's focus path: the badge stays quiet
+        // for it.
+        assert!(registry_entry(&gpui_base::input::Paste).is_none());
     }
 }

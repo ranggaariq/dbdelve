@@ -128,6 +128,7 @@ enum SettingId {
     SidebarDensity,
     SidebarShowHost,
     SidebarShowSizes,
+    ShortcutBadge,
     Font(FontSlot),
     /// A [`KeybindingSpec::id`].
     Keybinding(&'static str),
@@ -293,6 +294,24 @@ fn setting_rows() -> Vec<SettingRow> {
              for the connection in front. Off, DBDelve does not read sizes at \
              all.",
             &["sidebar", "tree", "bytes", "disk", "statistics"],
+        ),
+        row(
+            SettingId::ShortcutBadge,
+            SettingsTab::General,
+            "Keyboard",
+            "Shortcut badge",
+            "Briefly flash the chord of the shortcut just used, and what it \
+             did, above the status bar.",
+            &[
+                "keycast",
+                "shortcut",
+                "chord",
+                "flash",
+                "overlay",
+                "toast",
+                "notification",
+                "hint",
+            ],
         ),
         row(
             SettingId::CheckForUpdates,
@@ -1060,6 +1079,12 @@ fn render_control(
                 workspace.set_show_sizes(show, cx);
             }))
             .into_any_element(),
+        SettingId::ShortcutBadge => switch("shortcut-badge", settings.shortcut_badge, t)
+            .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
+                let show = !workspace.settings.shortcut_badge;
+                workspace.set_shortcut_badge(show, cx);
+            }))
+            .into_any_element(),
         SettingId::MatchSystemAppearance => switch(
             "match-system-appearance",
             settings.match_system_appearance,
@@ -1396,10 +1421,13 @@ mod tests {
 
     #[test]
     fn a_word_matches_within_one_field_not_across_them() {
+        // `sort` reaches the badge through "shortcut", the word a searcher
+        // for this row would type: fuzzy matching, subsequence and all.
         assert_eq!(
             found("sort"),
             [
                 SettingId::DefaultSorting,
+                SettingId::ShortcutBadge,
                 SettingId::Keybinding("reset_confirmations"),
                 SettingId::Keybinding("palette_history_filter"),
                 SettingId::Keybinding("palette_history_sort"),

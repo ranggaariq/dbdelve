@@ -17,6 +17,7 @@ mod folders;
 mod forms;
 mod import_dialog;
 mod import_rows;
+mod keycast;
 mod modes;
 mod objects;
 mod profiles;
@@ -117,6 +118,8 @@ pub(crate) struct Settings {
     pub(crate) show_host: bool,
     /// Whether either tree shows sizes, and whether any is read.
     pub(crate) show_sizes: bool,
+    /// Whether the keycast badge flashes the shortcut just fired.
+    pub(crate) shortcut_badge: bool,
 }
 
 impl Settings {
@@ -161,6 +164,7 @@ impl Default for Settings {
             density: Density::default(),
             show_host: true,
             show_sizes: true,
+            shortcut_badge: true,
         }
     }
 }
@@ -357,6 +361,13 @@ pub(crate) struct Workspace {
     /// tick the way `row_panel.copied` does. One flag rather than a keyed
     /// slot: only one plan pane is ever on screen at a time.
     pub(crate) plan_copied: bool,
+    /// What the keycast badge shows, if anything. Set by the keystroke
+    /// observer, drawn by [`keycast::layer`], taken down by its own timer.
+    pub(crate) keycast: Option<keycast::Flash>,
+    /// Counts every flash the badge has shown. The badge element is keyed by
+    /// it and each dismissal timer carries it, so a replaced chord's timer
+    /// cannot clear the flash that replaced it.
+    pub(crate) keycast_seq: u64,
     /// An import's read is still out, so a second click doesn't start another
     /// round of Keychain prompts whose summary would say all were duplicates.
     pub(crate) importing: bool,
@@ -536,6 +547,43 @@ impl Workspace {
             .observe_button_layout_changed(|window, _| window.refresh())
             .detach();
 
+        // The keycast badge. This runs inside key dispatch for every
+        // keystroke, typing included, so the cheap gates come first: only a
+        // keystroke a binding resolved and something consumed, only for an
+        // action a registry row holds -- and only once the workspace agrees,
+        // with the setting on and a chord-shaped chord, is any state touched.
+        // `App`'s observer rather than `Context`'s, whose wrapper would
+        // enter the workspace before anything could be filtered.
+        let this = cx.weak_entity();
+        App::observe_keystrokes(cx, move |event, _, cx| {
+            let Some(action) = event.action.as_deref() else {
+                return;
+            };
+            let Some(spec) = keybindings::registry_entry(action) else {
+                return;
+            };
+            this.update(cx, |workspace, cx| {
+                if !workspace.settings.shortcut_badge {
+                    return;
+                }
+                // Through `to_string`, so the borrow of the overrides ends
+                // before the flash takes the workspace. The first chord of a
+                // spec is the one shown; every multi-default row today flashes
+                // on all of them or stays quiet on all.
+                let chord = keybindings::chords_for(spec, &workspace.settings.custom_keybindings)
+                    .into_iter()
+                    .next()
+                    .filter(|chord| keycast::flashes(chord))
+                    .map(str::to_string);
+                let Some(chord) = chord else {
+                    return;
+                };
+                workspace.flash_keycast(spec.label, &chord, cx);
+            })
+            .ok();
+        })
+        .detach();
+
         let mut workspace = Self {
             profiles: Vec::new(),
             unavailable: Vec::new(),
@@ -584,6 +632,8 @@ impl Workspace {
                 revealed: Default::default(),
             },
             plan_copied: false,
+            keycast: None,
+            keycast_seq: 0,
             importing: false,
             pending_import: None,
             importable: crate::import::Source::ALL
@@ -737,6 +787,7 @@ impl Workspace {
                     Density::from_slug(stored_settings.sidebar_density.as_deref());
                 workspace.settings.show_host = stored_settings.sidebar_show_host.unwrap_or(true);
                 workspace.settings.show_sizes = stored_settings.sidebar_show_sizes.unwrap_or(true);
+                workspace.settings.shortcut_badge = stored_settings.shortcut_badge.unwrap_or(true);
                 // Ahead of the restore, which must not prune grids an
                 // unavailable profile under the same id still owns.
                 workspace.unavailable = unavailable;
@@ -1396,6 +1447,15 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(crate) fn set_shortcut_badge(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.settings.shortcut_badge == show {
+            return;
+        }
+        self.settings.shortcut_badge = show;
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
     /// The sorting a new tab starts with. Not applied to the tabs already
     /// open, for the reason `set_default_row_limit` is not: each holds its own.
     pub(crate) fn set_client_sort(&mut self, client: bool, cx: &mut Context<Self>) {
@@ -1686,6 +1746,10 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
+        // One badge over every surface the workspace draws: a chord can fire
+        // with a dialog, the palette or the form in front as surely as with a
+        // tab. (Library layers above us -- tooltips, menus -- paint later.)
+        let keycast = self.keycast.as_ref().map(|flash| keycast::layer(flash, t));
         let imports_rows = self.profile().is_some_and(|profile| {
             profile
                 .session
@@ -1940,7 +2004,8 @@ impl Render for Workspace {
                     window,
                     cx,
                 ))
-                .children(self.palette.clone());
+                .children(self.palette.clone())
+                .children(keycast);
         }
         let Some(profile) = self.profile() else {
             return div()
@@ -1988,7 +2053,8 @@ impl Render for Workspace {
                     window,
                     cx,
                 ))
-                .children(self.palette.clone());
+                .children(self.palette.clone())
+                .children(keycast);
         };
         let failed = matches!(profile.state, ProfileState::Failed(_));
         let status = match &profile.state {
@@ -2904,6 +2970,7 @@ impl Render for Workspace {
             ))
             .children(self.palette.clone())
             .children(self.render_reference_popup(cx))
+            .children(keycast)
     }
 }
 

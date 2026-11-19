@@ -750,6 +750,10 @@ pub struct StoredSettings {
     /// written while the default is classic. A scalar, above the tables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_mode: Option<String>,
+    /// Whether the keycast badge flashes the shortcut just fired. Absent
+    /// reads as on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortcut_badge: Option<bool>,
     /// Keybinding overrides, keyed by the action id in
     /// `keybindings::REGISTRY`. Only the ones a user actually changed --
     /// everything else stays on whatever the running build defaults to.
@@ -4844,6 +4848,7 @@ open_objects = []
                 sidebar_show_sizes: Some(false),
                 queries_move_dismissed: Some(true),
                 edit_mode: Some("row".into()),
+                shortcut_badge: Some(false),
                 custom_keybindings: Some(HashMap::from([(
                     "apply_edits".to_string(),
                     "cmd-shift-s".to_string(),

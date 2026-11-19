@@ -195,6 +195,7 @@ impl Workspace {
                 .filter(|dismissed| *dismissed),
             edit_mode: (self.settings.edit_mode != EditMode::default())
                 .then(|| self.settings.edit_mode.slug().into()),
+            shortcut_badge: Some(self.settings.shortcut_badge),
             custom_keybindings: Some(self.settings.custom_keybindings.clone()),
             theme_opacity: Some(self.settings.theme_opacity.clone()),
         };

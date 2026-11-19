@@ -914,6 +914,122 @@ fn alt_arrows_move_the_keyboard_between_the_buffer_and_the_rows(cx: &mut TestApp
     });
 }
 
+/// The keycast badge: what the keymap just fired, flashed for a moment and
+/// gone. Only chords carrying a modifier beyond shift flash, and only for
+/// actions the registry holds.
+#[gpui::test]
+fn the_keycast_badge_flashes_the_shortcut_just_fired(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+
+        // Typing is the editor's, never a shortcut.
+        cx.simulate_input("select 1");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.keycast.is_none(), "typing flashed");
+        });
+
+        // A chord nothing binds resolves to no action.
+        cx.simulate_keystrokes("alt-right");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.keycast.is_none(), "an unbound chord flashed");
+        });
+
+        // A registry chord flashes, named as the registry holds it -- both
+        // strokes of a two-stroke chord, not the one that completed it --
+        // with the action's own words.
+        cx.simulate_keystrokes("alt-down");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let flash = workspace.keycast.as_ref().expect("alt-down flashed");
+            assert_eq!(flash.chord, "alt-down");
+            assert_eq!(flash.label, "Focus Results");
+        });
+        assert!(
+            cx.debug_bounds("keycast-badge").is_some(),
+            "the badge is not drawn"
+        );
+
+        // A second chord replaces the first rather than stacking beside it.
+        cx.simulate_keystrokes("secondary-k r");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let flash = workspace.keycast.as_ref().expect("secondary-k r flashed");
+            assert_eq!(flash.chord, "secondary-k r");
+            assert_eq!(flash.label, "Toggle Editor / Results Focus");
+        });
+
+        // The chord it displaced does not take the badge down with it: half
+        // a second in, the new chord goes up, and the displaced one's timer
+        // fires before the new one's.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.simulate_keystrokes("alt-up");
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let flash = workspace
+                .keycast
+                .as_ref()
+                .expect("the newer flash survived the displaced chord's timer");
+            assert_eq!(flash.chord, "alt-up");
+            assert_eq!(flash.label, "Focus Editor");
+        });
+
+        // A second later it is gone.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.keycast.is_none(), "the flash never dismissed");
+        });
+        assert!(
+            cx.debug_bounds("keycast-badge").is_none(),
+            "the badge is still drawn"
+        );
+
+        // The palette's own navigation fires registry actions too, and none
+        // of it is chord-shaped enough to flash: no modifier on `down`, and
+        // `shift-tab`'s only one is shift.
+        cx.simulate_keystrokes("secondary-shift-p");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let flash = workspace
+                .keycast
+                .as_ref()
+                .expect("the palette's chord flashed");
+            assert_eq!(flash.chord, "secondary-shift-p");
+            assert_eq!(flash.label, "Command Palette");
+        });
+        cx.simulate_keystrokes("down shift-tab");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let flash = workspace
+                .keycast
+                .as_ref()
+                .expect("the palette flash was lost");
+            assert_eq!(flash.label, "Command Palette", "palette navigation flashed");
+        });
+
+        // Off, nothing flashes: the palette flash stays as it was, and the
+        // next chord raises nothing.
+        workspace.update(cx, |workspace, cx| workspace.set_shortcut_badge(false, cx));
+        cx.simulate_keystrokes("alt-down");
+        settle(cx);
+        workspace.read_with(cx, |workspace, _| {
+            let flash = workspace
+                .keycast
+                .as_ref()
+                .expect("the palette flash was lost");
+            assert_eq!(flash.label, "Command Palette", "a chord flashed while off");
+        });
+
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn the_sidebar_takes_the_keyboard_and_escape_hands_it_back(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
