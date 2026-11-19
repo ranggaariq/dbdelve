@@ -436,6 +436,8 @@ pub enum Command {
     SetFont(FontSlot, String),
     ToggleSidebar,
     FocusSidebar,
+    FocusResults,
+    FocusEditor,
     CollapseAllSchemas,
     ExpandAllSchemas,
     ToggleResultsFocus,
@@ -4589,6 +4591,28 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                 WINDOW,
             ),
             "toggle_results_focus",
+        ));
+    }
+    // The directional pair next to the toggle they refine: only ever offered
+    // on a query tab, whose editor buffer and rows they step between.
+    if session.active_query_tab().is_some() {
+        items.push(bound(
+            command(
+                "Focus results grid",
+                icon::RESULTS,
+                Command::FocusResults,
+                WINDOW,
+            ),
+            "focus_results",
+        ));
+        items.push(bound(
+            command(
+                "Focus editor",
+                icon::SCRATCH_QUERY,
+                Command::FocusEditor,
+                WINDOW,
+            ),
+            "focus_editor",
         ));
     }
     if matches!(session.active, Tab::Query(_)) {

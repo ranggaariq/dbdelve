@@ -629,6 +629,49 @@ fn the_keyboard_moves_between_the_buffer_and_its_rows(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn alt_arrows_move_the_keyboard_between_the_buffer_and_the_rows(cx: &mut TestAppContext) {
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        cx.simulate_input("select 1");
+        // No rows yet: the grid below has nothing to take the keyboard with,
+        // and the buffer keeps it.
+        cx.simulate_keystrokes("alt-down");
+        settle(cx);
+        assert!(
+            editor_has_keyboard(&workspace, cx),
+            "with no rows yet, the buffer keeps it"
+        );
+
+        cx.simulate_keystrokes("secondary-enter");
+        settle(cx);
+        cx.simulate_keystrokes("alt-down");
+        settle(cx);
+        assert!(grid_has_keyboard(&workspace, cx));
+        query_tab(&workspace, cx, |tab, _, cx| {
+            assert_eq!(tab.results.read(cx).delegate().active(), Some((0, 0)));
+        });
+        // The rows already hold the keyboard: alt-down leaves them holding it.
+        cx.simulate_keystrokes("alt-down");
+        settle(cx);
+        assert!(grid_has_keyboard(&workspace, cx));
+
+        cx.simulate_keystrokes("alt-up");
+        settle(cx);
+        assert!(editor_has_keyboard(&workspace, cx));
+        cx.simulate_input("x");
+        settle(cx);
+        assert_eq!(buffer(&workspace, cx), "select 1x");
+
+        // The buffer already holds the keyboard: alt-up leaves it holding it.
+        cx.simulate_keystrokes("alt-up");
+        settle(cx);
+        assert!(editor_has_keyboard(&workspace, cx));
+
+        quit(workspace, cx);
+    });
+}
+
+#[gpui::test]
 fn the_sidebar_takes_the_keyboard_and_escape_hands_it_back(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
         let (workspace, cx) = launch_on_sqlite_holding(cx, "create table birds (name text);");

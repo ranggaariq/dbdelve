@@ -278,7 +278,11 @@ The shape a change to the main pane has to fit (`session.rs`, with the
   grid in front (`Workspace::front_grid`: one drawn, with a row in it; a plan
   or the run's messages have nothing to step through, so it stays put), and
   `result_grid::take_keyboard` hands the library the ring's row so its arrows
-  step from where the ring is. A structure tab's grid takes focus like a data
+  step from where the ring is. The alt-arrows move it one way each between a
+  query tab's buffer and its grid: Alt+ArrowDown (`focus_results`) puts it on
+  the grid and holds still when it is already there or `front_grid` finds
+  nothing to step through; Alt+ArrowUp (`focus_editor`) hands it back to the
+  buffer. A structure tab's grid takes focus like a data
   tab's, its handle held by the loading line until the grid is drawn, and a
   relation's by the message that stands in for an empty result. Focus
   Sidebar (`secondary-k e`) puts the keyboard in the explorer's tree, which

@@ -5,7 +5,9 @@
 
 use super::sidebar::front_row_id;
 use super::*;
-use crate::actions::{FocusSidebar, OpenSidebarItem, ToggleResults, ToggleResultsFocus};
+use crate::actions::{
+    FocusEditor, FocusResults, FocusSidebar, OpenSidebarItem, ToggleResults, ToggleResultsFocus,
+};
 use crate::explorer::Shortcut;
 use crate::session::PendingDiscard;
 use crate::sidebar::{ViewMode, connection_row};
@@ -1171,6 +1173,72 @@ impl Workspace {
             Focus::Buffer(editor) => editor.focus_handle(cx).focus(window, cx),
             Focus::Field(_) | Focus::Window => return,
         }
+        // A hand-back asked for earlier would take the keyboard straight back.
+        if let Some(profile) = self.profile_mut() {
+            profile.session.editor_needs_focus = false;
+        }
+        cx.notify();
+    }
+
+    /// Down from the statement to the rows it ran. With the keyboard already
+    /// on the rows, or nothing drawn to step through, it does nothing.
+    pub(crate) fn focus_results(
+        &mut self,
+        _: &FocusResults,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette.is_some() || self.dialog_in_front.get().is_some() || self.form.is_some() {
+            return;
+        }
+        let Some(session) = self.profile().map(|profile| &profile.session) else {
+            return;
+        };
+        // A query tab's pane pair: an object tab has no buffer above its rows
+        // to come down from.
+        if session.editor(session.active).is_none() {
+            return;
+        }
+        if session
+            .active_results()
+            .is_some_and(|grid| grid.focus_handle(cx).contains_focused(window, cx))
+        {
+            return;
+        }
+        let Some(Focus::Grid(grid)) = self.front_grid(cx) else {
+            return;
+        };
+        grid.update(cx, |table, cx| {
+            crate::result_grid::take_keyboard(table, window, cx)
+        });
+        // A hand-back asked for earlier would take the keyboard straight back.
+        if let Some(profile) = self.profile_mut() {
+            profile.session.editor_needs_focus = false;
+        }
+        cx.notify();
+    }
+
+    /// Up from the rows back to the statement above them. With the keyboard
+    /// already on the buffer it does nothing.
+    pub(crate) fn focus_editor(
+        &mut self,
+        _: &FocusEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette.is_some() || self.dialog_in_front.get().is_some() || self.form.is_some() {
+            return;
+        }
+        let Some(session) = self.profile().map(|profile| &profile.session) else {
+            return;
+        };
+        let Some(editor) = session.editor(session.active) else {
+            return;
+        };
+        if editor.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        editor.focus_handle(cx).focus(window, cx);
         // A hand-back asked for earlier would take the keyboard straight back.
         if let Some(profile) = self.profile_mut() {
             profile.session.editor_needs_focus = false;
