@@ -32,7 +32,7 @@ use sqlparser::dialect::{
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser as SqlParser;
 use sqlparser::tokenizer::{Location, Token, Tokenizer, Whitespace};
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 use crate::db::{
     BinaryLiteral, ColumnDefinition, Engine, EngineSpec, ExplainMode, ExplainPrefix, FormatDialect,
@@ -50,6 +50,11 @@ pub struct Buffer {
 impl Buffer {
     /// Every dialect's buffer but SQL Server's, which [`Buffer::for_engine`]
     /// reads.
+    ///
+    /// The fresh parse, kept for the tests to pin the held one against: the
+    /// gates split statements through [`Buffer::for_engine`], and the one
+    /// per-keystroke caller now holds a `Parse` instead.
+    #[cfg(test)]
     pub fn parse(sql: &str) -> Self {
         Self {
             statements: statements_in(sql),
@@ -134,6 +139,132 @@ impl Buffer {
             .or_else(|| self.statements.first())
             .cloned()
     }
+}
+
+/// A buffer's parse, kept between calls and brought up to date by each.
+///
+/// `Buffer::parse` builds a fresh parser and reparses the whole text every
+/// call -- right for the gates, which run once per statement the buffer sends,
+/// and wrong for the completion provider, which asks once per keystroke. This
+/// holds the parser and the previous tree, finds what a keystroke moved by
+/// diffing the texts, and marks the edit so tree-sitter reparses from there
+/// instead of from scratch. It finds the statements a fresh parse finds; the
+/// tests run the two side by side over a stream of edits.
+///
+/// Scoped to the completion provider, and about boundaries only: nothing
+/// reads a statement's meaning off it. The editor and the filter bar drive
+/// the same provider, so a switch between them reparses whole once.
+pub(crate) struct Parse {
+    /// The text `tree` was parsed from. Compared against the buffer to find
+    /// what moved, and replaced when it differs.
+    text: String,
+    parser: Parser,
+    tree: Option<Tree>,
+    buffer: Buffer,
+}
+
+impl Parse {
+    pub(crate) fn new() -> Self {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_sequel::LANGUAGE.into())
+            .ok();
+        Self {
+            text: String::new(),
+            parser,
+            tree: None,
+            buffer: Buffer {
+                statements: Vec::new(),
+            },
+        }
+    }
+
+    /// The statement `offset` sits in, after bringing the parse up to `sql`.
+    /// The same question [`Buffer::statement_at`] answers, on a parse this has
+    /// not thrown away.
+    pub(crate) fn statement_at(&mut self, sql: &str, offset: usize) -> Option<Range<usize>> {
+        if self.text != sql {
+            self.refresh(sql);
+        }
+        self.buffer.statement_at(offset)
+    }
+
+    fn refresh(&mut self, sql: &str) {
+        if let (Some(tree), Some(edit)) = (self.tree.as_mut(), edit_between(&self.text, sql)) {
+            tree.edit(&edit);
+        }
+        let tree = self.parser.parse(sql, self.tree.as_ref());
+        self.buffer = Buffer {
+            statements: tree
+                .as_ref()
+                .map(|tree| collect_statements(tree, sql))
+                .unwrap_or_default(),
+        };
+        self.tree = tree;
+        self.text = sql.to_string();
+    }
+}
+
+/// The edit that turns `old` into `new`, as tree-sitter records one: the one
+/// run of bytes the two do not share, widened to whole characters, with the
+/// row and column each end sits at. `None` when they share everything.
+///
+/// Only one edit, however many the change really was: every difference lies
+/// inside this one range, and marking more of the tree stale than moved only
+/// reparses text a fresh parse would read the same way.
+fn edit_between(old: &str, new: &str) -> Option<InputEdit> {
+    let (old_bytes, new_bytes) = (old.as_bytes(), new.as_bytes());
+    let mut start = 0;
+    while start < old_bytes.len() && start < new_bytes.len() && old_bytes[start] == new_bytes[start]
+    {
+        start += 1;
+    }
+    if start == old_bytes.len() && start == new_bytes.len() {
+        return None;
+    }
+    let (mut old_end, mut new_end) = (old_bytes.len(), new_bytes.len());
+    while old_end > start && new_end > start && old_bytes[old_end - 1] == new_bytes[new_end - 1] {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    // The byte diff can stop inside a multi-byte character, whose halves are
+    // read apart though the character never split: widen the range to the
+    // whole characters on either side. The prefix is the same bytes in both
+    // texts, so a boundary in one is one in the other.
+    while start > 0 && !old.is_char_boundary(start) {
+        start -= 1;
+    }
+    while old_end < old.len() && !old.is_char_boundary(old_end) {
+        old_end += 1;
+    }
+    while new_end < new.len() && !new.is_char_boundary(new_end) {
+        new_end += 1;
+    }
+    Some(InputEdit {
+        start_byte: start,
+        old_end_byte: old_end,
+        new_end_byte: new_end,
+        start_position: point_at(old, start),
+        old_end_position: point_at(old, old_end),
+        new_end_position: point_at(new, new_end),
+    })
+}
+
+/// Where a byte sits, as the row it is on and the column it holds within it.
+fn point_at(text: &str, byte: usize) -> Point {
+    let mut point = Point::default();
+    for byte in &text.as_bytes()[..byte] {
+        match byte {
+            b'\n' => {
+                point = Point {
+                    row: point.row + 1,
+                    column: 0,
+                }
+            }
+            _ => point.column += 1,
+        }
+    }
+    point
 }
 
 /// What a selection of several statements runs as, one submission apiece:
@@ -5142,6 +5273,132 @@ mod tests {
         assert_eq!(Mode::ReadOnly.next(), Mode::ReadWrite);
         assert_eq!(Mode::ReadWrite.next(), Mode::Full);
         assert_eq!(Mode::Full.next(), Mode::ReadOnly);
+    }
+
+    #[test]
+    fn a_parse_kept_between_edits_finds_the_boundaries_a_fresh_parse_finds() {
+        // The provider holds its parse across a run of keystrokes, so an edit
+        // inside one statement must never disturb the boundaries of the
+        // others, whatever the edit is. A seeded stream of inserts and
+        // deletes -- SQL, punctuation, quotes left unclosed, multi-byte
+        // characters -- over a buffer of several statements, each step
+        // compared against the fresh parse of the same text.
+        let mut sql = String::from(
+            "SELECT 1;\nSELECT total FROM orders WHERE id = 3;\n-- note\nUPDATE orders SET total = 5;\n",
+        );
+        let mut parse = Parse::new();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut pick = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let insertions = [
+            "a", ";", "(", ")", "'", "--", "é", "SELECT ", "\n", ",", "$$", "*/",
+        ];
+        for step in 0..300 {
+            match pick(4) {
+                0..=2 => {
+                    let mut at = pick(sql.len() + 1);
+                    while !sql.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    sql.insert_str(at, insertions[pick(insertions.len())]);
+                }
+                _ if !sql.is_empty() => {
+                    let mut at = pick(sql.len());
+                    while !sql.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    let mut end = (at + 1).min(sql.len());
+                    while !sql.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    sql.replace_range(at..end, "");
+                }
+                _ => continue,
+            }
+            let fresh = Buffer::parse(&sql);
+            for offset in [0, sql.len() / 2, sql.len()] {
+                assert_eq!(
+                    parse.statement_at(&sql, offset),
+                    fresh.statement_at(offset),
+                    "step {step}, offset {offset}: {sql:?}"
+                );
+            }
+            assert_eq!(
+                parse.buffer.statements(),
+                fresh.statements(),
+                "step {step}: {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_between_marks_whole_characters_and_point_at_counts_bytes() {
+        // Fails the day a byte diff is left inside a character or a column
+        // counts characters instead of bytes -- neither of which the harness
+        // above can reach, it only ever moves whole characters at boundaries.
+
+        // é and ê share their lead byte, so the byte diff stops inside both:
+        // `start` widens back to the boundary before the character. Both are
+        // two bytes, so every end column is 2.
+        let edit = edit_between("é", "ê").unwrap();
+        assert_eq!(edit.start_byte, 0);
+        assert_eq!(edit.old_end_byte, 2);
+        assert_eq!(edit.new_end_byte, 2);
+        assert_eq!(edit.start_position, Point { row: 0, column: 0 });
+        assert_eq!(edit.old_end_position, Point { row: 0, column: 2 });
+        assert_eq!(edit.new_end_position, Point { row: 0, column: 2 });
+
+        // The swap the harness cannot produce, and here nothing is shared:
+        // the whole buffer is one edit, and é's both bytes count toward the
+        // end columns, where a column per character would read 2.
+        let edit = edit_between("aé", "éa").unwrap();
+        assert_eq!(edit.start_byte, 0);
+        assert_eq!(edit.old_end_byte, 3);
+        assert_eq!(edit.new_end_byte, 3);
+        assert_eq!(edit.start_position, Point { row: 0, column: 0 });
+        assert_eq!(edit.old_end_position, Point { row: 0, column: 3 });
+        assert_eq!(edit.new_end_position, Point { row: 0, column: 3 });
+
+        // Pure insertion at 0: the old text ends where it begins.
+        let edit = edit_between("", "SELECT").unwrap();
+        assert_eq!(edit.start_byte, 0);
+        assert_eq!(edit.old_end_byte, 0);
+        assert_eq!(edit.new_end_byte, 6);
+        assert_eq!(edit.start_position, Point { row: 0, column: 0 });
+        assert_eq!(edit.old_end_position, Point { row: 0, column: 0 });
+        assert_eq!(edit.new_end_position, Point { row: 0, column: 6 });
+
+        // A whole multibyte character deleted: the old end counts both of
+        // é's bytes.
+        let edit = edit_between("xé", "x").unwrap();
+        assert_eq!(edit.start_byte, 1);
+        assert_eq!(edit.old_end_byte, 3);
+        assert_eq!(edit.new_end_byte, 1);
+        assert_eq!(edit.start_position, Point { row: 0, column: 1 });
+        assert_eq!(edit.old_end_position, Point { row: 0, column: 3 });
+        assert_eq!(edit.new_end_position, Point { row: 0, column: 1 });
+
+        // é and © share their last byte, so the tail of the byte diff stops
+        // inside both characters and both ends widen forward to the whole
+        // characters -- widening the prefix-and-suffix scan alone never
+        // exercises.
+        let edit = edit_between("aé", "a©").unwrap();
+        assert_eq!(edit.start_byte, 1);
+        assert_eq!(edit.old_end_byte, 3);
+        assert_eq!(edit.new_end_byte, 3);
+        assert_eq!(edit.start_position, Point { row: 0, column: 1 });
+        assert_eq!(edit.old_end_position, Point { row: 0, column: 3 });
+        assert_eq!(edit.new_end_position, Point { row: 0, column: 3 });
+
+        // Columns are bytes, per tree-sitter's TSPoint: two past é, and past
+        // the newline the row increments and é counts 2 again from row 1's
+        // own start.
+        assert_eq!(point_at("é", 2), Point { row: 0, column: 2 });
+        assert_eq!(point_at("é\né", 5), Point { row: 1, column: 2 });
     }
 
     #[test]

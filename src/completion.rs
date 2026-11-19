@@ -22,7 +22,14 @@
 //! `ERROR` node for. The one job a scan genuinely cannot do is know it is
 //! inside a string literal, and [`suppressed`] does that job on its own.
 
-use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc, sync::Arc};
+use std::{
+    borrow::Cow,
+    cell::{Ref, RefCell},
+    collections::HashMap,
+    ops::Range,
+    rc::Rc,
+    sync::Arc,
+};
 
 use gpui::{App, Result, Task, WeakEntity, Window};
 use gpui_component::input::{CompletionProvider, Rope, RopeExt};
@@ -189,6 +196,10 @@ const KEYWORDS: &[&str] = &[
 const SOURCE_KEYWORDS: &[&str] = &["from", "join", "update", "into", "table"];
 
 /// A completion the popup can offer, before it is ranked.
+///
+/// Cloned only for the few that survive ranking; the pool's copy of a
+/// candidate is what a keystroke scores against.
+#[derive(Clone)]
 struct Candidate {
     label: String,
     /// The grey text beside the label — the schema a relation is in, the
@@ -297,6 +308,9 @@ impl Candidate {
 ///
 /// Holds a snapshot rather than a live handle. The catalog is replaced whole
 /// when it reloads, and so is this — see `Workspace::install_completions`.
+/// Everything the catalog decides — the pool of names to rank, the parse that
+/// finds the statement the caret sits in — is therefore that snapshot's own,
+/// and a reload replaces it with the catalog and not after it.
 pub struct SchemaCompletions {
     engine: Engine,
     catalog: Arc<Catalog>,
@@ -313,6 +327,12 @@ pub struct SchemaCompletions {
     /// The matcher scores through `&mut self` and the trait hands us `&self`.
     /// One matcher reused rather than one per keystroke, as the palette does.
     fuzzy: RefCell<Fuzzy>,
+    /// The buffer's parse, kept from the last keystroke that needed it.
+    parsed: RefCell<sql::Parse>,
+    /// The catalog's half of the pool, built for the first keystroke that
+    /// ranks it and never after: the catalog cannot move under it, because a
+    /// catalog that reloads replaces this provider whole.
+    pool: RefCell<Option<Pool>>,
 }
 
 impl SchemaCompletions {
@@ -332,7 +352,19 @@ impl SchemaCompletions {
             alias,
             workspace: Some(workspace),
             fuzzy: RefCell::new(Fuzzy::new()),
+            parsed: RefCell::new(sql::Parse::new()),
+            pool: RefCell::new(None),
         }
+    }
+
+    /// The pool, built for the first keystroke that ranks from it.
+    fn pool(&self) -> Ref<'_, Pool> {
+        if self.pool.borrow().is_none() {
+            *self.pool.borrow_mut() = Some(Pool::new(self.engine, &self.catalog));
+        }
+        Ref::map(self.pool.borrow(), |pool| {
+            pool.as_ref().expect("the pool was just built")
+        })
     }
 
     /// The columns of a relation named anywhere in the catalog, as far as they
@@ -629,36 +661,7 @@ impl SchemaCompletions {
     }
 
     fn all_relations(&self, qualify: bool) -> Vec<Candidate> {
-        self.catalog
-            .schemas
-            .iter()
-            .flat_map(|schema| {
-                schema.relations.iter().map(move |rel| Candidate {
-                    qualified: qualify,
-                    ..Candidate::new(
-                        &rel.name,
-                        Some(schema.name.clone()),
-                        relation_kind(rel.kind),
-                    )
-                })
-            })
-            .collect()
-    }
-
-    fn all_routines(&self) -> Vec<Candidate> {
-        self.catalog
-            .schemas
-            .iter()
-            .flat_map(|schema| {
-                schema.routines.iter().map(|routine| {
-                    Candidate::new(
-                        &routine.name,
-                        Some(schema.name.clone()),
-                        CompletionItemKind::FUNCTION,
-                    )
-                })
-            })
-            .collect()
+        catalog_relations(&self.catalog, qualify)
     }
 
     fn schema_names(&self) -> Vec<Candidate> {
@@ -674,13 +677,18 @@ impl SchemaCompletions {
     /// Order matters twice over: the scorer's ties are broken by it, and an
     /// empty query scores everything equally, so this order *is* the list the
     /// user sees after a `.`.
-    fn candidates(
+    ///
+    /// The candidates that are the catalog's own — keywords, relations,
+    /// routines, built-ins — are borrowed from the pool and never copied to be
+    /// ranked; the statement's own are built here and owned.
+    fn candidates<'a>(
         &self,
         around: &Around,
         qualifier: Option<&str>,
         scope: Option<&(String, String)>,
         wanted: &mut Vec<(String, String)>,
-    ) -> Vec<Candidate> {
+        pool: &'a Pool,
+    ) -> Vec<Cow<'a, Candidate>> {
         let Around {
             statement, before, ..
         } = *around;
@@ -697,21 +705,29 @@ impl SchemaCompletions {
 
             let columns = self.columns_of(&relation, wanted);
             if !columns.is_empty() {
-                return columns;
+                return columns.into_iter().map(Cow::Owned).collect();
             }
             // Nothing held for it yet, which may only mean a fetch that has not
             // landed. Offering the schema's relations is the right answer when
             // the qualifier is a schema, and harmless when it is not: an
             // unknown name matches nothing.
-            return self.aliased(around, self.relations_in(qualifier), scope, wanted);
+            return self
+                .aliased(around, self.relations_in(qualifier), scope, wanted)
+                .into_iter()
+                .map(Cow::Owned)
+                .collect();
         }
 
         // A qualifier `qualifier_before` cannot read, `"audit".` say, is still
         // one, and qualifying after it would write a second.
         let qualify = self.qualify && !before.ends_with('.');
         if expects_relation(before) {
-            let mut candidates = self.aliased(around, self.all_relations(qualify), scope, wanted);
-            candidates.extend(self.schema_names());
+            let mut candidates = self
+                .aliased(around, self.all_relations(qualify), scope, wanted)
+                .into_iter()
+                .map(Cow::Owned)
+                .collect::<Vec<_>>();
+            candidates.extend(self.schema_names().into_iter().map(Cow::Owned));
             return candidates;
         }
 
@@ -720,9 +736,12 @@ impl SchemaCompletions {
         // every other `email` in the database, and than `EXISTS`. The scope's
         // columns lead them, as the relation the text is about without naming
         // it, and are not offered again when the text names it too.
-        let mut candidates = scope
+        let mut candidates: Vec<Cow<'a, Candidate>> = scope
             .map(|scope| self.columns_in(scope, wanted))
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(Cow::Owned)
+            .collect();
         candidates.extend(
             bindings(statement)
                 .into_iter()
@@ -734,29 +753,17 @@ impl SchemaCompletions {
                     relations
                 })
                 .iter()
-                .flat_map(|relation| self.columns_of_except(relation, scope, wanted)),
+                .flat_map(|relation| self.columns_of_except(relation, scope, wanted))
+                .map(Cow::Owned),
         );
-
-        // A keyword the dialect also has as a built-in (`NULL`, `COALESCE`) is
-        // offered once, as the built-in, which knows how it is written.
-        let builtins = self.engine.builtins();
-        candidates.extend(
-            KEYWORDS
-                .iter()
-                .filter(|keyword| {
-                    !builtins
-                        .iter()
-                        .any(|builtin| builtin.name.eq_ignore_ascii_case(keyword))
-                })
-                .map(|keyword| Candidate::new(*keyword, None, CompletionItemKind::KEYWORD)),
-        );
-        candidates.extend(self.all_relations(qualify));
-        candidates.extend(self.all_routines());
+        candidates.extend(pool.keywords.iter().map(Cow::Borrowed));
+        candidates.extend(pool.relations[qualify as usize].iter().map(Cow::Borrowed));
+        candidates.extend(pool.routines.iter().map(Cow::Borrowed));
         // Last, so on a tie the user's own objects win and a dialect's long
         // list can't push them past the cap. Not after an unreadable
         // qualifier: `"o".date_trunc(` is never a call.
         if !before.ends_with('.') {
-            candidates.extend(builtins.iter().map(Candidate::builtin));
+            candidates.extend(pool.builtins.iter().map(Cow::Borrowed));
         }
         candidates
     }
@@ -835,18 +842,26 @@ impl SchemaCompletions {
             Syntax::Sql => {}
             Syntax::Redis => {
                 let (word, candidates) = redis_candidates(sql, offset);
-                let ranked = rank(candidates, &sql[word.clone()], &mut self.fuzzy.borrow_mut())
-                    .into_iter()
-                    .map(|candidate| (word.clone(), candidate))
-                    .collect();
+                let ranked = rank(
+                    candidates.into_iter().map(Cow::Owned).collect(),
+                    &sql[word.clone()],
+                    &mut self.fuzzy.borrow_mut(),
+                )
+                .into_iter()
+                .map(|candidate| (word.clone(), candidate))
+                .collect();
                 return (ranked, wanted);
             }
             Syntax::Mongo => {
                 let candidates = self.mongo_candidates(sql, word.clone(), scope, &mut wanted);
-                let ranked = rank(candidates, &sql[word.clone()], &mut self.fuzzy.borrow_mut())
-                    .into_iter()
-                    .map(|candidate| (word.clone(), candidate))
-                    .collect();
+                let ranked = rank(
+                    candidates.into_iter().map(Cow::Owned).collect(),
+                    &sql[word.clone()],
+                    &mut self.fuzzy.borrow_mut(),
+                )
+                .into_iter()
+                .map(|candidate| (word.clone(), candidate))
+                .collect();
                 return (ranked, wanted);
             }
         }
@@ -864,8 +879,13 @@ impl SchemaCompletions {
             return (Vec::new(), wanted);
         }
 
-        let statement = sql::Buffer::parse(sql)
-            .statement_at(offset)
+        // The parse is the provider's own, kept from the last keystroke that
+        // asked, and brought up to date by this one: a keystroke reparses from
+        // its edit, not from the top of the buffer (`sql::Parse`).
+        let statement = self
+            .parsed
+            .borrow_mut()
+            .statement_at(sql, offset)
             .filter(|range| range.contains(&word.start) || range.end >= word.start)
             .unwrap_or(0..sql.len());
         let around = Around {
@@ -875,11 +895,16 @@ impl SchemaCompletions {
             tail: &sql[offset..statement.end.max(offset)],
         };
 
-        let candidates = self.candidates(&around, qualifier, scope, &mut wanted);
-        let ranked = rank(candidates, prefix, &mut self.fuzzy.borrow_mut())
-            .into_iter()
-            .map(|candidate| (word.clone(), candidate))
-            .collect();
+        // The pool's borrow lives through the ranking, which reads it without
+        // copying it; only the rows that survive the cap are owned.
+        let ranked = {
+            let pool = self.pool();
+            let candidates = self.candidates(&around, qualifier, scope, &mut wanted, &pool);
+            rank(candidates, prefix, &mut self.fuzzy.borrow_mut())
+        }
+        .into_iter()
+        .map(|candidate| (word.clone(), candidate))
+        .collect();
         (ranked, wanted)
     }
 }
@@ -903,11 +928,21 @@ impl CompletionProvider for SchemaCompletions {
         _: &mut Window,
         cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
-        // ponytail: the whole buffer is copied out of the rope on every
-        // keystroke, and parsed once more on top of the highlighter's own
-        // parse. A query buffer is a screen or two of text, so this is free at
-        // the size it runs at -- hold the tokens on the provider and invalidate
-        // them from `InputEvent::Change` if a very large buffer ever stutters.
+        // Most keystrokes do not ask a question: after a space, a newline or
+        // a paren the menu has nothing to offer, and two bytes off the rope
+        // say so, before the buffer is copied for the scans that would answer
+        // it. MongoDB's scan reads the text it wraps and cannot decide from
+        // the caret's neighbourhood, so it keeps the copy.
+        if self.engine.syntax() == Syntax::Sql && nothing_typed(text, offset) {
+            return Task::ready(Ok(CompletionResponse::Array(Vec::new())));
+        }
+        // ponytail: what moved between keystrokes is found by diffing the
+        // text against the one parsed last, which walks both texts byte by
+        // byte and then runs a branchy per-byte walk from byte 0 three times
+        // over to place the edit, and copies it once. The input knows the
+        // edit and does not hand it to the provider; a sync that costs the
+        // keystroke alone means teaching the trait the change event. Hold
+        // off until a buffer big enough to feel the walk.
         let sql = text.to_string();
         let (items, wanted) = self.items(&sql, offset);
         self.respond(text, items, wanted, cx)
@@ -1090,6 +1125,78 @@ fn relation_kind(kind: RelationKind) -> CompletionItemKind {
     }
 }
 
+/// Every relation in the catalog, `qualify` marking that accepting one writes
+/// the schema it is in.
+fn catalog_relations(catalog: &Catalog, qualify: bool) -> Vec<Candidate> {
+    catalog
+        .schemas
+        .iter()
+        .flat_map(|schema| {
+            schema.relations.iter().map(move |rel| Candidate {
+                qualified: qualify,
+                ..Candidate::new(
+                    &rel.name,
+                    Some(schema.name.clone()),
+                    relation_kind(rel.kind),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The catalog's half of the pool: the names a keystroke ranks whether or not
+/// the statement says anything yet, built once and borrowed from.
+///
+/// What a statement decides — the columns of the relations it names, the
+/// aliases it has taken — stays per keystroke; this never changes while the
+/// provider lives, and a catalog that reloads replaces the provider whole
+/// (`Workspace::install_completions`), pool and all.
+struct Pool {
+    /// The keywords worth completing, less the ones the dialect has as a
+    /// built-in, which are offered once, as the built-in.
+    keywords: Vec<Candidate>,
+    /// The relations, with `qualified` off and on: which a keystroke wants is
+    /// the text in front of the caret's decision, and ranking does not read it.
+    relations: [Vec<Candidate>; 2],
+    routines: Vec<Candidate>,
+    builtins: Vec<Candidate>,
+}
+
+impl Pool {
+    fn new(engine: Engine, catalog: &Catalog) -> Self {
+        let builtins = engine.builtins();
+        Self {
+            keywords: KEYWORDS
+                .iter()
+                .filter(|keyword| {
+                    !builtins
+                        .iter()
+                        .any(|builtin| builtin.name.eq_ignore_ascii_case(keyword))
+                })
+                .map(|keyword| Candidate::new(*keyword, None, CompletionItemKind::KEYWORD))
+                .collect(),
+            relations: [
+                catalog_relations(catalog, false),
+                catalog_relations(catalog, true),
+            ],
+            routines: catalog
+                .schemas
+                .iter()
+                .flat_map(|schema| {
+                    schema.routines.iter().map(|routine| {
+                        Candidate::new(
+                            &routine.name,
+                            Some(schema.name.clone()),
+                            CompletionItemKind::FUNCTION,
+                        )
+                    })
+                })
+                .collect(),
+            builtins: builtins.iter().map(Candidate::builtin).collect(),
+        }
+    }
+}
+
 /// Score every candidate against what has been typed, best first.
 ///
 /// The same matcher the palette uses, for the same reason: a fuzzy match is
@@ -1097,8 +1204,10 @@ fn relation_kind(kind: RelationKind) -> CompletionItemKind {
 ///
 /// Not [`Fuzzy::rank`]: that gives a tie to the shorter label, and here a tie
 /// keeps the order [`SchemaCompletions::candidates`] built, which puts the
-/// statement's own columns ahead of keywords.
-fn rank(candidates: Vec<Candidate>, prefix: &str, fuzzy: &mut Fuzzy) -> Vec<Candidate> {
+/// statement's own columns ahead of keywords. The pool's candidates are
+/// borrowed and the statement's owned, so only the rows that survive the cap
+/// are cloned out of either.
+fn rank(candidates: Vec<Cow<'_, Candidate>>, prefix: &str, fuzzy: &mut Fuzzy) -> Vec<Candidate> {
     let query = Query::new(prefix);
     let mut scored = candidates
         .into_iter()
@@ -1108,7 +1217,10 @@ fn rank(candidates: Vec<Candidate>, prefix: &str, fuzzy: &mut Fuzzy) -> Vec<Cand
     // what was typed like every other row, and there are only ever a few.
     scored.sort_by_key(|(score, candidate)| std::cmp::Reverse((candidate.on.is_some(), *score)));
     scored.truncate(MAX_ITEMS);
-    scored.into_iter().map(|(_, candidate)| candidate).collect()
+    scored
+        .into_iter()
+        .map(|(_, candidate)| candidate.into_owned())
+        .collect()
 }
 
 fn is_ident_byte(byte: u8) -> bool {
@@ -1163,6 +1275,32 @@ fn qualifier_before(sql: &str, word_start: usize) -> Option<&str> {
         start -= 1;
     }
     (start < dot).then(|| &sql[start..dot])
+}
+
+/// Whether nothing is typed and nothing qualifies at the caret -- where
+/// [`SchemaCompletions::items`] has no answer and returns none -- read
+/// straight off the rope rather than out of a copy of the buffer.
+///
+/// The two bytes in front of the caret are the whole question: a word ends at
+/// the caret exactly when the byte before it is an identifier byte
+/// ([`word_before`]), and a qualifier when that byte is a `.` with an
+/// identifier byte in front of it ([`qualifier_before`]). Everything else the
+/// scan would look at -- the statement, the catalog, the strings and comments
+/// -- only matters once one of the two is there.
+fn nothing_typed(text: &Rope, offset: usize) -> bool {
+    let offset = offset.min(text.len());
+    if !text.is_char_boundary(offset) {
+        return true;
+    }
+    let byte = |at: usize| text.bytes_at(at).next();
+    match offset.checked_sub(1).and_then(byte) {
+        None => true,
+        Some(byte) if is_ident_byte(byte) => false,
+        // A qualifier ends here when an identifier byte sits in front of the
+        // dot; a `.` at the very start has none in front of it.
+        Some(b'.') => offset < 2 || !byte(offset - 2).is_some_and(is_ident_byte),
+        Some(_) => true,
+    }
 }
 
 /// Whether `at` falls inside a string literal or a comment.
@@ -1701,6 +1839,8 @@ mod tests {
             alias: false,
             workspace: None,
             fuzzy: RefCell::new(Fuzzy::new()),
+            parsed: RefCell::new(sql::Parse::new()),
+            pool: RefCell::new(None),
         }
     }
 
@@ -1863,6 +2003,100 @@ mod tests {
     fn nothing_typed_and_nothing_qualified_offers_nothing() {
         assert!(labels("SELECT * FROM |").is_empty());
         assert!(labels("|").is_empty());
+    }
+
+    #[test]
+    fn nothing_typed_agrees_with_the_scan_of_the_copied_text() {
+        // The probe decides whether the buffer is worth copying at all, so it
+        // must answer exactly as the scan of that copy would. The long buffer
+        // puts the caret past the rope's first chunk, where its two bytes
+        // live in different ones.
+        let long = format!("SELECT * FROM {}", "word ".repeat(600));
+        let cases = [
+            "",
+            "|",
+            "SELECT * FROM |",
+            "SELECT * FROM acc|",
+            "SELECT accounts.|",
+            "SELECT (.|",
+            "SELECT a.b.|",
+            "\"audit\".|",
+            "é|",
+            "é", // no caret marker: the caret falls at text.len(), just past the character
+            "SELECT é FROM t |",
+            &format!("{long}|"),
+            &format!("SELECT * FROM {long}wo|rd"),
+        ];
+        for text in cases {
+            let offset = text.find('|').unwrap_or(text.len());
+            let sql = text.replace('|', "");
+            let word = word_before(&sql, offset);
+            let qualifier = qualifier_before(&sql, word.start);
+            assert_eq!(
+                nothing_typed(&Rope::from(&sql[..]), offset),
+                word.is_empty() && qualifier.is_none(),
+                "{text:?}"
+            );
+        }
+        // A caret inside a character is none of the loop's offsets, which are
+        // all boundaries, so the early return that makes one nothing typed --
+        // and the provider's answer empty -- is pinned directly.
+        assert!(nothing_typed(&Rope::from("é"), 1));
+    }
+
+    #[test]
+    fn the_pool_is_built_for_the_first_keystroke_that_ranks_it() {
+        // Nothing to build until a keystroke asks, and a buffer that completes
+        // from mql or redis commands never asks at all.
+        let completions = catalog();
+        assert!(completions.pool.borrow().is_none());
+        let offered = completions.items("SELECT * FROM acc", 17).0;
+        assert!(
+            offered
+                .iter()
+                .any(|(_, candidate)| candidate.label == "accounts")
+        );
+        assert!(completions.pool.borrow().is_some());
+    }
+
+    #[test]
+    fn a_pool_serves_no_catalog_but_the_one_its_provider_was_installed_with() {
+        // `install_completions` replaces the provider whole when the catalog
+        // reloads, so the pool is that provider's own. Were it ever shared,
+        // the relation a refresh dropped would stay offered for the life of
+        // the session.
+        let stale = detached(schemas(), COLUMNS);
+        assert!(
+            stale
+                .items("SELECT * FROM acc", 17)
+                .0
+                .iter()
+                .any(|(_, candidate)| candidate.label == "accounts")
+        );
+
+        let reloaded = detached(
+            Catalog {
+                schemas: vec![Schema {
+                    name: "public".to_string(),
+                    relations: vec![relation("events")],
+                    routines: Vec::new(),
+                    sequences: Vec::new(),
+                }],
+                database: None,
+            },
+            &[],
+        );
+        let offered = reloaded.items("SELECT * FROM eve", 17).0;
+        assert!(
+            offered
+                .iter()
+                .any(|(_, candidate)| candidate.label == "events")
+        );
+        assert!(
+            !offered
+                .iter()
+                .any(|(_, candidate)| candidate.label == "accounts")
+        );
     }
 
     #[test]
