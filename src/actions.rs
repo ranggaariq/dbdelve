@@ -255,6 +255,8 @@ actions!(
         ToggleStructure,
         ToggleResultsFocus,
         FocusSidebar,
+        FocusResults,
+        FocusEditor,
         CollapseAllSchemas,
         ExpandAllSchemas,
         OpenSidebarItem,

@@ -5,7 +5,8 @@
 
 use super::*;
 use crate::actions::{
-    CopyDiagnostics, FocusSidebar, OpenLogsFolder, ToggleResults, ToggleResultsFocus,
+    CopyDiagnostics, FocusEditor, FocusResults, FocusSidebar, OpenLogsFolder, ToggleResults,
+    ToggleResultsFocus,
 };
 use crate::keybindings;
 use crate::ui::Status;
@@ -826,6 +827,8 @@ impl Workspace {
             Command::SetFont(slot, family) => self.set_font(slot, family, cx),
             Command::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             Command::FocusSidebar => self.focus_sidebar(&FocusSidebar, window, cx),
+            Command::FocusResults => self.focus_results(&FocusResults, window, cx),
+            Command::FocusEditor => self.focus_editor(&FocusEditor, window, cx),
             Command::ExpandAllSchemas => self.expand_all_schemas(&ExpandAllSchemas, window, cx),
             Command::CollapseAllSchemas => {
                 self.collapse_all_schemas(&CollapseAllSchemas, window, cx)
