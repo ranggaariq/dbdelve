@@ -20,7 +20,8 @@
 //! error by definition — `SELECT * FROM ` is exactly the text a user most
 //! wants completed and exactly the text `tree_sitter_sequel` returns an
 //! `ERROR` node for. The one job a scan genuinely cannot do is know it is
-//! inside a string literal, and [`suppressed`] does that job on its own.
+//! inside a string literal, and the parse's suppression scan
+//! ([`sql::Parse::suppressed`]) does that job on its own.
 
 use std::{
     borrow::Cow,
@@ -865,29 +866,36 @@ impl SchemaCompletions {
                 return (ranked, wanted);
             }
         }
-        if suppressed(sql, word.start) {
-            return (Vec::new(), wanted);
-        }
-
         let prefix = &sql[word.clone()];
         let qualifier = qualifier_before(sql, word.start);
 
         // Nothing typed and nothing to qualify is not a question. Opening the
         // whole catalog on every space would put a popup over the buffer for
-        // most of the time anyone is writing in it.
+        // most of the time anyone is writing in it. Suppression waits until
+        // past this point for the same reason: a keystroke with no answer
+        // owes no scan for one.
         if prefix.is_empty() && qualifier.is_none() {
             return (Vec::new(), wanted);
         }
 
         // The parse is the provider's own, kept from the last keystroke that
         // asked, and brought up to date by this one: a keystroke reparses from
-        // its edit, not from the top of the buffer (`sql::Parse`).
+        // its edit, not from the top of the buffer (`sql::Parse`). It syncs
+        // here, before the suppression scan reads its resume point.
         let statement = self
             .parsed
             .borrow_mut()
             .statement_at(sql, offset)
             .filter(|range| range.contains(&word.start) || range.end >= word.start)
             .unwrap_or(0..sql.len());
+
+        // Silence inside a string literal or a comment, asked of the parse's
+        // text — current since the statement above — which resumes where the
+        // last keystroke's scan stopped instead of walking from byte 0.
+        if self.parsed.borrow_mut().suppressed(word.start) {
+            return (Vec::new(), wanted);
+        }
+
         let around = Around {
             statement: &sql[statement.clone()],
             before: &sql[..word.start],
@@ -936,20 +944,41 @@ impl CompletionProvider for SchemaCompletions {
         if self.engine.syntax() == Syntax::Sql && nothing_typed(text, offset) {
             return Task::ready(Ok(CompletionResponse::Array(Vec::new())));
         }
-        // ponytail: what moved between keystrokes is found by diffing the
-        // text against the one parsed last, which walks both texts byte by
-        // byte and then runs a branchy per-byte walk from byte 0 three times
-        // over to place the edit, and copies it once. The input knows the
-        // edit and does not hand it to the provider; a sync that costs the
-        // keystroke alone means teaching the trait the change event. Hold
-        // off until a buffer big enough to feel the walk.
-        let sql = text.to_string();
+        // ponytail: the rope arrives as a rope and every scan below reads a
+        // `str`, so a changed keystroke that asks anything still pays two
+        // buffer copies — the rope to a `String`, then the `String` into the
+        // `Rc<str>` the parse holds (`Parse::adopt`), which stable Rust
+        // cannot fold into one: the `Rc` refcount header must precede the
+        // data in the same allocation, so the `String`'s buffer is not
+        // reusable. A keystroke that only re-ranks — the text unchanged
+        // since the last one — allocates nothing: `synced` compares the
+        // rope against the text the parse already holds first. Ending the
+        // copies means teaching the trait the edit event: the input knows
+        // what moved and does not hand it to the provider. Hold off until
+        // the trait offers one.
+        let sql = self.synced(text);
         let (items, wanted) = self.items(&sql, offset);
         self.respond(text, items, wanted, cx)
     }
 }
 
 impl SchemaCompletions {
+    /// The parse's handle on `text`, with the parse brought up to date: the
+    /// scans in [`Self::items`] read a parse that is current before they ask
+    /// anything of it. A buffer that moved moves its one copy in; a keystroke
+    /// that only re-ranks — the text unchanged since the last one — takes the
+    /// held text without a copy being made of it. The handle is owned so the
+    /// borrow of the parse ends before [`Self::items`] asks it again.
+    fn synced(&self, text: &Rope) -> Rc<str> {
+        let mut parsed = self.parsed.borrow_mut();
+        if parse_holds(&parsed, text) {
+            return parsed.held();
+        }
+        let sql: Rc<str> = Rc::from(text.to_string());
+        parsed.adopt(&sql);
+        sql
+    }
+
     /// As many of `wanted`, in order, as may be asked for alongside the
     /// fetches already in flight.
     fn admitted(&self, mut wanted: Wanted) -> Wanted {
@@ -1030,6 +1059,22 @@ impl SchemaCompletions {
 
         Task::ready(Ok(CompletionResponse::Array(items)))
     }
+}
+
+/// Whether the parse already holds `text`: the rope's chunks against the held
+/// text, byte for byte, without building a copy to compare with. The first
+/// chunk that disagrees settles it.
+fn parse_holds(parse: &sql::Parse, text: &Rope) -> bool {
+    let held = parse.held();
+    let held: &str = &held;
+    let mut read = 0;
+    for chunk in text.chunks() {
+        if held.get(read..read + chunk.len()) != Some(chunk) {
+            return false;
+        }
+        read += chunk.len();
+    }
+    read == held.len()
 }
 
 /// The completion source for a raw filter bar on one relation's tab.
@@ -1301,68 +1346,6 @@ fn nothing_typed(text: &Rope, offset: usize) -> bool {
         Some(b'.') => offset < 2 || !byte(offset - 2).is_some_and(is_ident_byte),
         Some(_) => true,
     }
-}
-
-/// Whether `at` falls inside a string literal or a comment.
-///
-/// The one thing a keyword scan cannot get right by itself, and the one place
-/// a wrong completion does real damage: accepting a row inside a literal
-/// rewrites data rather than a query.
-///
-/// ponytail: `'` for strings, `--` and the block form for comments, and
-/// nothing else. Double quotes are deliberately absent -- Postgres reads them
-/// as a quoted identifier, where completing is exactly right, and MySQL reads
-/// them as a string, where it is not, and no scan can tell which server is
-/// listening. Dollar-quoted bodies are absent for a smaller reason: the text
-/// inside one is SQL too. Teach it the engine if a MySQL user is ever bitten.
-fn suppressed(sql: &str, at: usize) -> bool {
-    let bytes = sql.as_bytes();
-    let at = at.min(bytes.len());
-    let mut index = 0;
-
-    while index < at {
-        match bytes[index] {
-            b'\'' => {
-                index += 1;
-                loop {
-                    if index >= at || index >= bytes.len() {
-                        return true;
-                    }
-                    if bytes[index] == b'\'' {
-                        // Doubled, so it is an escaped quote and not the end.
-                        if bytes.get(index + 1) == Some(&b'\'') {
-                            index += 2;
-                            continue;
-                        }
-                        index += 1;
-                        break;
-                    }
-                    index += 1;
-                }
-            }
-            b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                let end = sql[index..]
-                    .find('\n')
-                    .map_or(bytes.len(), |offset| index + offset);
-                if at <= end {
-                    return true;
-                }
-                index = end + 1;
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                let end = sql[index + 2..]
-                    .find("*/")
-                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
-                if at < end {
-                    return true;
-                }
-                index = end;
-            }
-            _ => index += 1,
-        }
-    }
-
-    false
 }
 
 /// The word-shaped tokens of a statement, in order. Dots are kept inside a

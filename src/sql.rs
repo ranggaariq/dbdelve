@@ -15,6 +15,7 @@
 
 use std::borrow::Cow;
 use std::ops::{ControlFlow, Range};
+use std::rc::Rc;
 
 use serde::Deserialize;
 // Aliased: `tree_sitter::Parser` already owns the name `Parser` in this file,
@@ -155,12 +156,48 @@ impl Buffer {
 /// reads a statement's meaning off it. The editor and the filter bar drive
 /// the same provider, so a switch between them reparses whole once.
 pub(crate) struct Parse {
-    /// The text `tree` was parsed from. Compared against the buffer to find
-    /// what moved, and replaced when it differs.
-    text: String,
+    /// The text `tree` was parsed from, shared with the caller that handed
+    /// it over. A changed keystroke copies the buffer twice — rope to
+    /// `String`, then `String` into this `Rc<str>` — where stable Rust
+    /// cannot fold them into one; see the ponytail in
+    /// `SchemaCompletions::completions` for the full story. A keystroke
+    /// whose text is unchanged allocates nothing — the caller compares the
+    /// rope against what is held here first and takes this `Rc` back.
+    /// Ending the copies on the changed path means the trait delivering the
+    /// edit event. Compared against the buffer to find what moved.
+    text: Rc<str>,
     parser: Parser,
     tree: Option<Tree>,
     buffer: Buffer,
+    /// Where the suppression scan last stopped and what it was inside there,
+    /// so [`Self::suppressed`] resumes from it instead of walking from byte 0
+    /// on every keystroke. `refresh` starts the scan over when its edit
+    /// reaches back into the prefix already scanned.
+    suppression: Suppression,
+}
+
+/// What the suppression scan was inside at the byte it stopped at.
+#[derive(Clone, Copy)]
+enum Inside {
+    Nothing,
+    /// A `'` literal. A doubled quote is an escaped quote, never the end.
+    String,
+    /// A `--` comment, which its newline ends.
+    LineComment,
+    /// A `/* … */` comment, read flat: a `/*` inside one is text.
+    BlockComment,
+    /// Inside a block comment, on a `*` that may be closing it. Kept apart
+    /// from [`Inside::BlockComment`] so a stop between the two bytes of a
+    /// `*/` still resumes seeing the closer.
+    BlockStar,
+}
+
+/// The suppression scan's resume point: the state at byte `at` of the text
+/// the parse holds.
+#[derive(Clone, Copy)]
+struct Suppression {
+    at: usize,
+    inside: Inside,
 }
 
 impl Parse {
@@ -170,28 +207,117 @@ impl Parse {
             .set_language(&tree_sitter_sequel::LANGUAGE.into())
             .ok();
         Self {
-            text: String::new(),
+            text: Rc::from(String::new()),
             parser,
             tree: None,
             buffer: Buffer {
                 statements: Vec::new(),
             },
+            suppression: Suppression {
+                at: 0,
+                inside: Inside::Nothing,
+            },
         }
+    }
+
+    /// A handle on the text the parse holds. A caller reads the buffer
+    /// through this — the same allocation the parse holds — rather than
+    /// through a copy of it.
+    pub(crate) fn held(&self) -> Rc<str> {
+        Rc::clone(&self.text)
     }
 
     /// The statement `offset` sits in, after bringing the parse up to `sql`.
     /// The same question [`Buffer::statement_at`] answers, on a parse this has
     /// not thrown away.
     pub(crate) fn statement_at(&mut self, sql: &str, offset: usize) -> Option<Range<usize>> {
-        if self.text != sql {
+        if *self.text != *sql {
             self.refresh(sql);
+            self.text = Rc::from(sql);
         }
         self.buffer.statement_at(offset)
     }
 
+    /// Take `sql` over as the parsed text, reparsing from the edit. For a
+    /// caller that has already proved the buffer moved and paid for the
+    /// text: this copies nothing further, the `Rc` it is handed is what the
+    /// parse holds — but that `Rc` is itself the second buffer copy (why
+    /// stable Rust cannot fold it into one: see the ponytail in
+    /// `SchemaCompletions::completions`). An unchanged keystroke never
+    /// reaches here, and ending the copies means the trait delivering the
+    /// edit event.
+    pub(crate) fn adopt(&mut self, sql: &Rc<str>) {
+        self.refresh(sql);
+        self.text = Rc::clone(sql);
+    }
+
+    /// Whether `at` falls inside a string literal or a comment, on a parse
+    /// already brought up to date with the text being read — the caller asks
+    /// right after [`Self::statement_at`], which is what syncs it.
+    ///
+    /// The one thing a keyword scan cannot get right by itself, and the one
+    /// place a wrong completion does real damage: accepting a row inside a
+    /// literal rewrites data rather than a query.
+    ///
+    /// The scan resumes from where the last one stopped instead of walking
+    /// from byte 0 on every keystroke: an edit at or after that stop leaves
+    /// every byte before it alone, so the state found there still holds, and
+    /// an edit that reaches back into the scanned prefix starts the scan over
+    /// (`refresh` knows where its edit begins).
+    ///
+    /// ponytail: `'` for strings, `--` and the block form for comments, and
+    /// nothing else. Double quotes are deliberately absent -- Postgres reads
+    /// them as a quoted identifier, where completing is exactly right, and
+    /// MySQL reads them as a string, where it is not, and no scan can tell
+    /// which server is listening. Dollar-quoted bodies are absent for a
+    /// smaller reason: the text inside one is SQL too. Teach it the engine if
+    /// a MySQL user is ever bitten.
+    pub(crate) fn suppressed(&mut self, at: usize) -> bool {
+        let bytes = self.text.as_bytes();
+        let at = at.min(bytes.len());
+        // An earlier stop serves this one only when it sits at or before it:
+        // a shorter ask cannot know the state at a byte it stops before, and
+        // starts from the top instead.
+        let (from, inside) = if at >= self.suppression.at {
+            (self.suppression.at, self.suppression.inside)
+        } else {
+            (0, Inside::Nothing)
+        };
+        let stop = scan_suppression(bytes, from, at, inside);
+        self.suppression = stop;
+        match stop.inside {
+            Inside::Nothing => false,
+            Inside::String | Inside::LineComment => true,
+            // An unclosed block comment reads as ending with the text, the
+            // way the full scan reads it: only a byte strictly inside one is
+            // suppressed, so the byte at the buffer's very end is not.
+            Inside::BlockComment | Inside::BlockStar => at < bytes.len(),
+        }
+    }
+
+    /// Reparse from `sql`'s edit, leaving the held text alone — the caller
+    /// stores it, owning the one copy.
     fn refresh(&mut self, sql: &str) {
-        if let (Some(tree), Some(edit)) = (self.tree.as_mut(), edit_between(&self.text, sql)) {
-            tree.edit(&edit);
+        let edit = self
+            .tree
+            .as_ref()
+            .and_then(|_| edit_between(&self.text, sql));
+        if let (Some(tree), Some(edit)) = (self.tree.as_mut(), edit.as_ref()) {
+            tree.edit(edit);
+        }
+        // An edit reaching back into the prefix already scanned leaves the
+        // resume point describing bytes the text no longer has; the scan
+        // starts over. The byte at `start_byte` is the first that moved, so a
+        // stop past it sits inside what moved and is discarded, while a stop
+        // at or before it still describes only bytes the edit left alone.
+        if edit
+            .as_ref()
+            .is_some_and(|edit| edit.start_byte < self.suppression.at)
+        {
+            self.suppression = Suppression {
+                at: 0,
+                inside: Inside::Nothing,
+            };
         }
         let tree = self.parser.parse(sql, self.tree.as_ref());
         self.buffer = Buffer {
@@ -201,8 +327,77 @@ impl Parse {
                 .unwrap_or_default(),
         };
         self.tree = tree;
-        self.text = sql.to_string();
     }
+}
+
+/// The suppression scan over `bytes[from..to]`, picking up at `start`: one
+/// byte per step, so a stop anywhere — including between the bytes of a `*/`
+/// or a doubled quote — resumes exactly as a full scan from byte 0 would
+/// continue. Returns where it stopped and what it was inside there.
+///
+/// The stop may sit one byte past `to`: a doubled quote is consumed as the
+/// pair it is, so the state is never cached between its two bytes. An opener
+/// read one byte ahead — `--`, `/*` — may complete at `to` itself, which a
+/// full scan also sees.
+fn scan_suppression(bytes: &[u8], from: usize, to: usize, start: Inside) -> Suppression {
+    let mut inside = start;
+    let mut index = from;
+    while index < to {
+        match inside {
+            Inside::Nothing => match bytes[index] {
+                b'\'' => {
+                    inside = Inside::String;
+                    index += 1;
+                }
+                b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                    inside = Inside::LineComment;
+                    index += 2;
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    inside = Inside::BlockComment;
+                    index += 2;
+                }
+                _ => index += 1,
+            },
+            Inside::String => {
+                if bytes[index] == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                    } else {
+                        inside = Inside::Nothing;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            Inside::LineComment => {
+                if bytes[index] == b'\n' {
+                    inside = Inside::Nothing;
+                }
+                index += 1;
+            }
+            Inside::BlockComment => {
+                if bytes[index] == b'*' {
+                    inside = Inside::BlockStar;
+                }
+                index += 1;
+            }
+            Inside::BlockStar => {
+                // A run of stars inside the comment: only the `/` closes it,
+                // and any star before it may still be the closer's first.
+                inside = if bytes[index] == b'/' {
+                    Inside::Nothing
+                } else if bytes[index] == b'*' {
+                    Inside::BlockStar
+                } else {
+                    Inside::BlockComment
+                };
+                index += 1;
+            }
+        }
+    }
+    Suppression { at: index, inside }
 }
 
 /// The edit that turns `old` into `new`, as tree-sitter records one: the one
@@ -212,11 +407,27 @@ impl Parse {
 /// Only one edit, however many the change really was: every difference lies
 /// inside this one range, and marking more of the tree stale than moved only
 /// reparses text a fresh parse would read the same way.
+///
+/// One pass from byte 0 finds where the shared prefix ends and, on the way,
+/// the row and column it sits at; the ends' points are that point advanced
+/// over the envelope alone. The envelope may hold newlines of its own; the
+/// bytes around it are shared, so no end point needs a walk of its own.
 fn edit_between(old: &str, new: &str) -> Option<InputEdit> {
     let (old_bytes, new_bytes) = (old.as_bytes(), new.as_bytes());
     let mut start = 0;
-    while start < old_bytes.len() && start < new_bytes.len() && old_bytes[start] == new_bytes[start]
-    {
+    let mut start_point = Point::default();
+    while start < old_bytes.len() && start < new_bytes.len() {
+        if old_bytes[start] != new_bytes[start] {
+            break;
+        }
+        if old_bytes[start] == b'\n' {
+            start_point = Point {
+                row: start_point.row + 1,
+                column: 0,
+            };
+        } else {
+            start_point.column += 1;
+        }
         start += 1;
     }
     if start == old_bytes.len() && start == new_bytes.len() {
@@ -230,10 +441,14 @@ fn edit_between(old: &str, new: &str) -> Option<InputEdit> {
     // The byte diff can stop inside a multi-byte character, whose halves are
     // read apart though the character never split: widen the range to the
     // whole characters on either side. The prefix is the same bytes in both
-    // texts, so a boundary in one is one in the other.
+    // texts, so a boundary in one is one in the other. Widening `start` back
+    // gives the columns its continuation bytes had taken, and the character
+    // they belong to falls to the end points' advance below.
+    let unwidened = start;
     while start > 0 && !old.is_char_boundary(start) {
         start -= 1;
     }
+    start_point.column -= unwidened - start;
     while old_end < old.len() && !old.is_char_boundary(old_end) {
         old_end += 1;
     }
@@ -244,24 +459,25 @@ fn edit_between(old: &str, new: &str) -> Option<InputEdit> {
         start_byte: start,
         old_end_byte: old_end,
         new_end_byte: new_end,
-        start_position: point_at(old, start),
-        old_end_position: point_at(old, old_end),
-        new_end_position: point_at(new, new_end),
+        start_position: start_point,
+        old_end_position: point_after(start_point, &old[start..old_end]),
+        new_end_position: point_after(start_point, &new[start..new_end]),
     })
 }
 
-/// Where a byte sits, as the row it is on and the column it holds within it.
-fn point_at(text: &str, byte: usize) -> Point {
-    let mut point = Point::default();
-    for byte in &text.as_bytes()[..byte] {
-        match byte {
-            b'\n' => {
-                point = Point {
-                    row: point.row + 1,
-                    column: 0,
-                }
-            }
-            _ => point.column += 1,
+/// The point `text` ends at, counted from `from`: a byte per column, and a
+/// new row with the column zeroed at each newline — tree-sitter's arithmetic,
+/// where a column is bytes and a multi-byte character is as many as it holds.
+fn point_after(from: Point, text: &str) -> Point {
+    let mut point = from;
+    for byte in text.as_bytes() {
+        if *byte == b'\n' {
+            point = Point {
+                row: point.row + 1,
+                column: 0,
+            };
+        } else {
+            point.column += 1;
         }
     }
     point
@@ -5984,8 +6200,131 @@ mod tests {
         }
     }
 
+    /// The suppression answer a full scan from byte 0 gives, for the resume
+    /// test to agree with: the scan as it read before it could resume.
+    fn suppressed_from_byte_0(sql: &str, at: usize) -> bool {
+        let bytes = sql.as_bytes();
+        let at = at.min(bytes.len());
+        let mut index = 0;
+
+        while index < at {
+            match bytes[index] {
+                b'\'' => {
+                    index += 1;
+                    loop {
+                        if index >= at || index >= bytes.len() {
+                            return true;
+                        }
+                        if bytes[index] == b'\'' {
+                            // Doubled, so it is an escaped quote and not the end.
+                            if bytes.get(index + 1) == Some(&b'\'') {
+                                index += 2;
+                                continue;
+                            }
+                            index += 1;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                    let end = sql[index..]
+                        .find('\n')
+                        .map_or(bytes.len(), |offset| index + offset);
+                    if at <= end {
+                        return true;
+                    }
+                    index = end + 1;
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    let end = sql[index + 2..]
+                        .find("*/")
+                        .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+                    if at < end {
+                        return true;
+                    }
+                    index = end;
+                }
+                _ => index += 1,
+            }
+        }
+
+        false
+    }
+
     #[test]
-    fn edit_between_marks_whole_characters_and_point_at_counts_bytes() {
+    fn a_resumed_suppression_scan_agrees_with_one_from_byte_0() {
+        // The suppression scan resumes from wherever the last one stopped, so
+        // an edit sequence must leave it answering exactly what a scan from
+        // byte 0 answers. A seeded stream of inserts and deletes -- quotes
+        // left unclosed, comment pieces, multi-byte characters -- over a
+        // buffer of statements, each step asked the way the provider asks:
+        // at the caret, which sits at or above where the last scan stopped,
+        // climbing to the end from there, and only rarely back at byte 0.
+        // That is what puts the resume point to work: an edit reaching back
+        // into the scanned prefix leaves a stale stop that an ask at or
+        // above it would resume from, so `refresh` must start the scan over
+        // -- disabling that reset fails this test. An ask below an earlier
+        // stop still starts the scan over on its own; those happen here too.
+        let mut sql = String::from(
+            "SELECT 1; -- note\nSELECT 'it''s' FROM t;\n/* block */ UPDATE t SET x = 1;\n",
+        );
+        let mut parse = Parse::new();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut pick = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let insertions = [
+            "a", ";", "'", "--", "/*", "*/", "\n", "é", "SELECT ", "'x'", "/",
+        ];
+        for step in 0..300 {
+            match pick(4) {
+                0..=2 => {
+                    let mut at = pick(sql.len() + 1);
+                    while !sql.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    sql.insert_str(at, insertions[pick(insertions.len())]);
+                }
+                _ if !sql.is_empty() => {
+                    let mut at = pick(sql.len());
+                    while !sql.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    let mut end = (at + 1).min(sql.len());
+                    while !sql.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    sql.replace_range(at..end, "");
+                }
+                _ => continue,
+            }
+            // The provider's keystroke brings the parse up to date before it
+            // asks about suppression; so does this.
+            parse.statement_at(&sql, sql.len());
+            // First ask where the caret sits -- at or above the last scan's
+            // stop -- then climbing to the end; back at byte 0 only rarely.
+            let mut at = sql.len() - pick(sql.len() / 4 + 1);
+            while at <= sql.len() {
+                assert_eq!(
+                    parse.suppressed(at),
+                    suppressed_from_byte_0(&sql, at),
+                    "step {step}, at {at}: {sql:?}"
+                );
+                at = if pick(64) == 0 {
+                    0
+                } else {
+                    at + 1 + pick(sql.len() / 3 + 1)
+                };
+            }
+        }
+    }
+
+    #[test]
+    fn edit_between_marks_whole_characters_and_counts_columns_in_bytes() {
         // Fails the day a byte diff is left inside a character or a column
         // counts characters instead of bytes -- neither of which the harness
         // above can reach, it only ever moves whole characters at boundaries.
@@ -6043,11 +6382,28 @@ mod tests {
         assert_eq!(edit.old_end_position, Point { row: 0, column: 3 });
         assert_eq!(edit.new_end_position, Point { row: 0, column: 3 });
 
-        // Columns are bytes, per tree-sitter's TSPoint: two past é, and past
-        // the newline the row increments and é counts 2 again from row 1's
-        // own start.
-        assert_eq!(point_at("é", 2), Point { row: 0, column: 2 });
-        assert_eq!(point_at("é\né", 5), Point { row: 1, column: 2 });
+        // Columns are bytes, per tree-sitter's TSPoint, and a newline splits
+        // the rows: the second é of `é\né` sits at row 1 column 2, both its
+        // bytes counted from its own row's start. Both texts move one byte of
+        // that é, so the edit starts at its lead byte and each end advances
+        // the start point over the é alone.
+        let edit = edit_between("é\né", "é\nê").unwrap();
+        assert_eq!(edit.start_byte, 3);
+        assert_eq!(edit.start_position, Point { row: 1, column: 0 });
+        assert_eq!(edit.old_end_byte, 5);
+        assert_eq!(edit.new_end_byte, 5);
+        assert_eq!(edit.old_end_position, Point { row: 1, column: 2 });
+        assert_eq!(edit.new_end_position, Point { row: 1, column: 2 });
+
+        // A newline inside the envelope increments the row there, not from
+        // byte 0: the old end is the start point advanced over `b\nc`.
+        let edit = edit_between("ab\ncd", "axd").unwrap();
+        assert_eq!(edit.start_byte, 1);
+        assert_eq!(edit.start_position, Point { row: 0, column: 1 });
+        assert_eq!(edit.old_end_byte, 4);
+        assert_eq!(edit.new_end_byte, 2);
+        assert_eq!(edit.old_end_position, Point { row: 1, column: 1 });
+        assert_eq!(edit.new_end_position, Point { row: 0, column: 2 });
     }
 
     #[test]
