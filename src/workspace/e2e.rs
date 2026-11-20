@@ -589,6 +589,101 @@ fn ctrl_space_asks_for_completions_in_the_query_buffer(cx: &mut TestAppContext) 
     });
 }
 
+/// What a mid-word keystroke costs on the real editor path, against a buffer
+/// of generated statements: launched headless, tab in front, caret at the end
+/// of a partial identifier, one keystroke at a time through the keymap and
+/// focus path, the completion provider answering each. The mean per keystroke
+/// is printed and nothing strict is asserted — the number is the deliverable,
+/// and a budget would fail a busy runner rather than name a regression.
+///
+/// A debug build of this crate is unoptimized, so this is compiled in release
+/// only, like the diagram layout's budget test: `cargo test --release -- \
+/// --ignored --nocapture a_mid_word_keystroke_cost`.
+#[cfg(not(debug_assertions))]
+#[gpui::test]
+#[ignore = "a wall-clock budget, meaningful in a release build only"]
+fn a_mid_word_keystroke_cost_is_printed_for_two_buffer_sizes(cx: &mut TestAppContext) {
+    use std::time::{Duration, Instant};
+
+    /// A deterministic buffer of `lines` one-statement lines, ending mid-
+    /// identifier so every measured keystroke below extends one.
+    fn generated_buffer(lines: usize) -> String {
+        let mut sql = String::with_capacity(lines * 64 + 21);
+        for line in 0..lines {
+            sql.push_str(&format!(
+                "SELECT col_{}, note_{} FROM tab_{} WHERE flag_{} = {};\n",
+                line % 9,
+                line % 5,
+                line % 7,
+                line % 11,
+                line % 13
+            ));
+        }
+        sql.push_str("SELECT total FROM acc");
+        sql
+    }
+
+    // Nine-letter words: a letter, and a space every tenth so the word being
+    // typed never grows past what an identifier is. Only the letters are
+    // mid-word keystrokes; the spaces are typed, just not measured.
+    fn keystroke(step: usize) -> char {
+        match step % 10 {
+            9 => ' ',
+            at => char::from(b'a' + at as u8),
+        }
+    }
+
+    store::tests::with_home(|| {
+        let (workspace, cx) = launch_on_sqlite(cx);
+        let editor = query_tab(&workspace, cx, |tab, _, _| tab.editor.clone());
+
+        for (lines, keystrokes) in [(130, 90), (7000, 200)] {
+            let buffer_sql = generated_buffer(lines);
+            let end = buffer_sql.len();
+            cx.update(|window, cx| {
+                editor.update(cx, |input, cx| {
+                    input.set_value(buffer_sql, window, cx);
+                    input.set_selected_range(end..end, cx);
+                });
+            });
+            settle(cx);
+
+            // The first keystroke on a new buffer parses it whole and opens
+            // the menu. A warm-up run keeps the mean measuring a keystroke
+            // rather than the one that paid for the buffer.
+            let mut step = 0;
+            while step < 10 {
+                let ch = keystroke(step);
+                step += 1;
+                cx.simulate_input(&ch.to_string());
+            }
+
+            let mut total = Duration::ZERO;
+            let mut measured = 0;
+            while measured < keystrokes {
+                let ch = keystroke(step);
+                step += 1;
+                if ch == ' ' {
+                    cx.simulate_input(" ");
+                } else {
+                    let started = Instant::now();
+                    cx.simulate_input(&ch.to_string());
+                    total += started.elapsed();
+                    measured += 1;
+                }
+            }
+            println!(
+                "{lines} lines ({} bytes): {measured} mid-word keystrokes, \
+                 mean {:.0} µs/keystroke",
+                end,
+                total.as_nanos() as f64 / measured as f64 / 1000.0,
+            );
+        }
+
+        quit(workspace, cx);
+    });
+}
+
 #[gpui::test]
 fn the_keyboard_moves_between_the_buffer_and_its_rows(cx: &mut TestAppContext) {
     store::tests::with_home(|| {
