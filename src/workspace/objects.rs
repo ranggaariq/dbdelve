@@ -15,6 +15,8 @@ use crate::sidebar::{
     NodeAction, NodeKind, SelectedNode, SelectionAction, schema_row_is_a_database,
 };
 
+use std::sync::PoisonError;
+
 /// A definition being read: the connection it was asked of, by id and
 /// generation, and the read itself.
 type DdlRead = (String, u64, gpui::Task<Result<String, DbError>>);
@@ -1399,7 +1401,8 @@ impl Workspace {
                         profile
                             .session
                             .completion_columns
-                            .borrow_mut()
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
                             .insert(key, completion::ColumnState::Loaded(structure.into()));
                     }
                     // Addressed by tab, so a second object opened while this was

@@ -901,6 +901,13 @@ fn a_mid_word_keystroke_cost_is_printed_for_two_buffer_sizes(cx: &mut TestAppCon
                 cx.simulate_input(&ch.to_string());
             }
 
+            // The full round trip, as the round-1 commit measured it:
+            // `simulate_input` runs the test scheduler's background queue
+            // after every keystroke, so with the completion work on the
+            // background executor this number still contains it -- drained
+            // inline here, where the real app would run it beside the
+            // keystroke on another core. An upper bound, and the continuity
+            // with that commit's numbers.
             let mut total = Duration::ZERO;
             let mut measured = 0;
             while measured < keystrokes {
@@ -917,9 +924,40 @@ fn a_mid_word_keystroke_cost_is_printed_for_two_buffer_sizes(cx: &mut TestAppCon
             }
             println!(
                 "{lines} lines ({} bytes): {measured} mid-word keystrokes, \
-                 mean {:.0} µs/keystroke",
+                 round trip mean {:.0} µs/keystroke",
                 end,
                 total.as_nanos() as f64 / measured as f64 / 1000.0,
+            );
+
+            // The number the typing lag is made of: the keystroke dispatch
+            // alone, nothing drained. The test scheduler runs background
+            // tasks only on a drain, so the completion compute cannot land
+            // here -- what remains is what the main thread pays before the
+            // keystroke handler can return, which is when the character
+            // echoes. Every tenth keystroke is a space, whose drain keeps
+            // the queued computes from piling up; spaces are not measured.
+            let mut dispatch = Duration::ZERO;
+            let mut measured = 0;
+            while measured < keystrokes {
+                let ch = keystroke(step);
+                step += 1;
+                if ch == ' ' {
+                    cx.simulate_input(" ");
+                } else {
+                    let typed = ch.to_string();
+                    let started = Instant::now();
+                    cx.update(|window, cx| {
+                        window.dispatch_keystroke(gpui::Keystroke::parse(&typed).unwrap(), cx);
+                    });
+                    dispatch += started.elapsed();
+                    measured += 1;
+                }
+            }
+            println!(
+                "{lines} lines ({} bytes): {measured} mid-word keystrokes, \
+                 dispatch-only mean {:.0} µs/keystroke",
+                end,
+                dispatch.as_nanos() as f64 / measured as f64 / 1000.0,
             );
         }
 

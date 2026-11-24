@@ -769,8 +769,10 @@ pub(crate) struct Session {
     pub(crate) completion_columns: completion::ColumnCache,
     /// What every editor on this connection completes from, as
     /// `Workspace::install_completions` last built it. Kept for a filter bar
-    /// turned raw after that, which completes from the same one.
-    pub(crate) completions: Option<Rc<completion::SchemaCompletions>>,
+    /// turned raw after that, which completes from the same one. An `Arc`
+    /// because the filter bar's background task must hold its provider, and
+    /// the editors' own wrapper is the engine's `Rc<dyn CompletionProvider>`.
+    pub(crate) completions: Option<Arc<completion::SchemaCompletions>>,
     pub(crate) explorer_filter: Entity<InputState>,
     pub(crate) explorer_tree: Entity<TreeState>,
     pub(crate) explorer_leaves: Arc<HashMap<String, ExplorerLeaf>>,

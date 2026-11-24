@@ -25,14 +25,12 @@
 
 use std::{
     borrow::Cow,
-    cell::{Ref, RefCell},
     collections::HashMap,
     ops::Range,
-    rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
-use gpui::{App, Result, Task, WeakEntity, Window};
+use gpui::{App, AppContext as _, Result, Task, WeakEntity, Window};
 use gpui_component::input::{CompletionProvider, Rope, RopeExt};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
@@ -114,11 +112,12 @@ const FETCH_ATTEMPTS: u8 = 3;
 /// otherwise fill. One left over is asked for on a later keystroke.
 const FETCHES_IN_FLIGHT: usize = 4;
 
-/// Columns by schema and relation, shared between the provider that reads them
-/// and the workspace that fills them. `Rc` rather than `Arc` because both live
-/// on the foreground thread; the fetch itself is a background task that hands
-/// its result back before it touches this.
-pub type ColumnCache = Rc<RefCell<HashMap<(String, String), ColumnState>>>;
+/// Columns by schema and relation, shared between the provider that reads
+/// them -- on the background executor, mid-decision -- and the workspace that
+/// fills them, on the main thread when a describe lands. A std `Mutex` whose
+/// critical sections are lookups and inserts, never a whole decision and
+/// never an await.
+pub type ColumnCache = Arc<Mutex<HashMap<(String, String), ColumnState>>>;
 
 /// Schema and relation pairs whose columns a completion wanted and the cache
 /// did not hold.
@@ -312,6 +311,13 @@ impl Candidate {
 /// Everything the catalog decides — the pool of names to rank, the parse that
 /// finds the statement the caret sits in — is therefore that snapshot's own,
 /// and a reload replaces it with the catalog and not after it.
+///
+/// Cloned per request: the trait hands the provider `&self` and the heavy
+/// work has to move to the background executor, which takes a `Send` future,
+/// so a clone goes into the task instead. The clone shares every cache — the
+/// fields are `Arc`s and `Copy` values — so the popup and the filter bars it
+/// is installed beside all decide from one parse and one pool.
+#[derive(Clone)]
 pub struct SchemaCompletions {
     engine: Engine,
     catalog: Arc<Catalog>,
@@ -322,18 +328,28 @@ pub struct SchemaCompletions {
     alias: bool,
     /// Who to ask when a relation's columns are wanted and not yet held.
     ///
-    /// `None` only in this module's own tests, which drive [`Self::items`]
+    /// `None` only in this module's own tests, which drive `items`
     /// against a pre-filled cache and never reach the fetch.
     workspace: Option<WeakEntity<Workspace>>,
     /// The matcher scores through `&mut self` and the trait hands us `&self`.
     /// One matcher reused rather than one per keystroke, as the palette does.
-    fuzzy: RefCell<Fuzzy>,
-    /// The buffer's parse, kept from the last keystroke that needed it.
-    parsed: RefCell<sql::Parse>,
+    /// Behind a lock because the decision that scores through it runs on the
+    /// background executor; the guard lives only across the ranking.
+    fuzzy: Arc<Mutex<Fuzzy>>,
+    /// The buffer's parse, kept from the last keystroke that needed it. Its
+    /// incremental state is the point — a keystroke reparses from its edit —
+    /// so one parse is shared and serialized behind this lock, never copied
+    /// per request, and the lock spans the reads that must see one text.
+    /// Poison is deliberately ignored: a panicked compute costs one request,
+    /// not the editor — the next request takes the guard and `statement_at`
+    /// re-derives whatever the panic left from the text it holds.
+    parsed: Arc<Mutex<sql::Parse>>,
     /// The catalog's half of the pool, built for the first keystroke that
     /// ranks it and never after: the catalog cannot move under it, because a
-    /// catalog that reloads replaces this provider whole.
-    pool: RefCell<Option<Pool>>,
+    /// catalog that reloads replaces this provider whole. Two requests racing
+    /// to build it serialize in `get_or_init` — the second waits for the
+    /// first, so it is built exactly once.
+    pool: Arc<OnceLock<Pool>>,
 }
 
 impl SchemaCompletions {
@@ -352,20 +368,16 @@ impl SchemaCompletions {
             qualify,
             alias,
             workspace: Some(workspace),
-            fuzzy: RefCell::new(Fuzzy::new()),
-            parsed: RefCell::new(sql::Parse::new()),
-            pool: RefCell::new(None),
+            fuzzy: Arc::new(Mutex::new(Fuzzy::new())),
+            parsed: Arc::new(Mutex::new(sql::Parse::new())),
+            pool: Arc::new(OnceLock::new()),
         }
     }
 
     /// The pool, built for the first keystroke that ranks from it.
-    fn pool(&self) -> Ref<'_, Pool> {
-        if self.pool.borrow().is_none() {
-            *self.pool.borrow_mut() = Some(Pool::new(self.engine, &self.catalog));
-        }
-        Ref::map(self.pool.borrow(), |pool| {
-            pool.as_ref().expect("the pool was just built")
-        })
+    fn pool(&self) -> &Pool {
+        self.pool
+            .get_or_init(|| Pool::new(self.engine, &self.catalog))
     }
 
     /// The columns of a relation named anywhere in the catalog, as far as they
@@ -447,6 +459,9 @@ impl SchemaCompletions {
 
     /// What is held about one relation, read through `read`, recording it
     /// into `wanted` when nothing is.
+    ///
+    /// `read` runs under the lock, as the borrow it replaces did, and none of
+    /// the readers reach back into the cache, so the section stays short.
     fn described<T>(
         &self,
         key: (String, String),
@@ -458,7 +473,8 @@ impl SchemaCompletions {
                 wanted.push(key);
             }
         };
-        match self.columns.borrow().get(&key) {
+        let columns = self.columns.lock().unwrap_or_else(PoisonError::into_inner);
+        match columns.get(&key) {
             Some(ColumnState::Loaded(described)) => return Some(read(described)),
             // Failed, but not yet often enough to give up on.
             Some(ColumnState::Failed(attempts)) if *attempts < FETCH_ATTEMPTS => want(key),
@@ -818,14 +834,16 @@ impl SchemaCompletions {
     /// Separate from [`CompletionProvider::completions`] and taking `&str`
     /// rather than a `Rope` so the tests can reach it without a window.
     /// Returns the rows to show, and the relations whose columns are wanted and
-    /// not yet held — which the caller fetches, because this one is `&self` and
-    /// has no window to spawn from.
+    /// not yet held — which [`Self::respond`] admits, on the main thread,
+    /// because admission needs the `App`.
+    #[cfg(test)]
     fn items(&self, sql: &str, offset: usize) -> (Vec<(Range<usize>, Candidate)>, Wanted) {
         self.items_in(sql, offset, None)
     }
 
-    /// [`Self::items`] for text about one relation it does not name: its
-    /// `(schema, relation)` is `scope`, whose columns are offered first.
+    /// The whole decision, from buffer text to the rows the popup shows, for
+    /// text about one relation: its `(schema, relation)` is `scope`, whose
+    /// columns are offered first. `items` is the tests' window onto this.
     fn items_in(
         &self,
         sql: &str,
@@ -846,7 +864,7 @@ impl SchemaCompletions {
                 let ranked = rank(
                     candidates.into_iter().map(Cow::Owned).collect(),
                     &sql[word.clone()],
-                    &mut self.fuzzy.borrow_mut(),
+                    &mut self.fuzzy.lock().unwrap_or_else(PoisonError::into_inner),
                 )
                 .into_iter()
                 .map(|candidate| (word.clone(), candidate))
@@ -858,7 +876,7 @@ impl SchemaCompletions {
                 let ranked = rank(
                     candidates.into_iter().map(Cow::Owned).collect(),
                     &sql[word.clone()],
-                    &mut self.fuzzy.borrow_mut(),
+                    &mut self.fuzzy.lock().unwrap_or_else(PoisonError::into_inner),
                 )
                 .into_iter()
                 .map(|candidate| (word.clone(), candidate))
@@ -881,18 +899,26 @@ impl SchemaCompletions {
         // The parse is the provider's own, kept from the last keystroke that
         // asked, and brought up to date by this one: a keystroke reparses from
         // its edit, not from the top of the buffer (`sql::Parse`). It syncs
-        // here, before the suppression scan reads its resume point.
-        let statement = self
-            .parsed
-            .borrow_mut()
-            .statement_at(sql, offset)
-            .filter(|range| range.contains(&word.start) || range.end >= word.start)
-            .unwrap_or(0..sql.len());
+        // here, before the suppression scan reads its resume point, and both
+        // reads hold the lock together: they must describe the same text, and
+        // the editor and the filter bar drive one provider, so a concurrent
+        // request could otherwise move the parse between the two. The ranking
+        // after this runs unlocked -- it reads the text, the catalog and the
+        // caches, not the parse.
+        let (statement, inside) = {
+            let mut parsed = self.parsed.lock().unwrap_or_else(PoisonError::into_inner);
+            let statement = parsed
+                .statement_at(sql, offset)
+                .filter(|range| range.contains(&word.start) || range.end >= word.start)
+                .unwrap_or(0..sql.len());
+            let inside = parsed.suppressed(word.start);
+            (statement, inside)
+        };
 
         // Silence inside a string literal or a comment, asked of the parse's
-        // text — current since the statement above — which resumes where the
+        // text -- current since the statement above -- which resumes where the
         // last keystroke's scan stopped instead of walking from byte 0.
-        if self.parsed.borrow_mut().suppressed(word.start) {
+        if inside {
             return (Vec::new(), wanted);
         }
 
@@ -907,18 +933,63 @@ impl SchemaCompletions {
         // copying it; only the rows that survive the cap are owned.
         let ranked = {
             let pool = self.pool();
-            let candidates = self.candidates(&around, qualifier, scope, &mut wanted, &pool);
-            rank(candidates, prefix, &mut self.fuzzy.borrow_mut())
+            let candidates = self.candidates(&around, qualifier, scope, &mut wanted, pool);
+            rank(
+                candidates,
+                prefix,
+                &mut self.fuzzy.lock().unwrap_or_else(PoisonError::into_inner),
+            )
         }
         .into_iter()
         .map(|candidate| (word.clone(), candidate))
         .collect();
         (ranked, wanted)
     }
+
+    /// The heavy half of one completion request, run on the background
+    /// executor: the buffer copy when the text moved, the parse's incremental
+    /// sync, and the decision [`Self::items_in`] makes. What the keystroke's
+    /// own thread pays is the probe, a rope clone and this spawn.
+    fn compute(
+        &self,
+        rope: &Rope,
+        offset: usize,
+        scope: Option<&(String, String)>,
+    ) -> (Vec<(Range<usize>, Candidate)>, Wanted) {
+        // The copy the scans read, taken under the parse's lock so a
+        // concurrent request cannot sync the parse between the check and the
+        // adopt: skipped when the parse already holds this text — a keystroke
+        // that only re-ranks still allocates nothing — else one rope-to-
+        // `String` copy, paid here and not inside the keystroke.
+        //
+        // ponytail: the rope arrives as a rope and every scan reads a `str`,
+        // so a changed keystroke still pays two buffer copies — the rope to a
+        // `String`, then the `String` into the `Arc<str>` the parse holds
+        // (`Parse::adopt`), which stable Rust cannot fold into one: the
+        // refcount header must precede the data in the same allocation, so
+        // the `String`'s buffer is not reusable. They used to sit inside the
+        // keystroke; round two of the typing-lag fix moved them here, where
+        // they cost a background thread a few hundred microseconds instead
+        // of the character its echo. Ending the copies means teaching the
+        // trait the edit event: the input knows what moved and does not hand
+        // it to the provider. Hold off until the trait offers one.
+        let sql: Arc<str> = {
+            let mut parsed = self.parsed.lock().unwrap_or_else(PoisonError::into_inner);
+            if parse_holds(&parsed, rope) {
+                parsed.held()
+            } else {
+                let sql: Arc<str> = Arc::from(rope.to_string());
+                parsed.adopt(&sql);
+                sql
+            }
+        };
+        self.items_in(&sql, offset, scope)
+    }
 }
 
 impl CompletionProvider for SchemaCompletions {
-    /// Every edit asks, and [`SchemaCompletions::items`] decides.
+    /// Every edit asks, and the decision — [`Self::items_in`], running on
+    /// the background executor — answers.
     ///
     /// Answering `false` here would leave an open popup standing, because the
     /// input only reconsiders the menu when the provider is consulted. An
@@ -944,73 +1015,64 @@ impl CompletionProvider for SchemaCompletions {
         if self.engine.syntax() == Syntax::Sql && nothing_typed(text, offset) {
             return Task::ready(Ok(CompletionResponse::Array(Vec::new())));
         }
-        // ponytail: the rope arrives as a rope and every scan below reads a
-        // `str`, so a changed keystroke that asks anything still pays two
-        // buffer copies — the rope to a `String`, then the `String` into the
-        // `Rc<str>` the parse holds (`Parse::adopt`), which stable Rust
-        // cannot fold into one: the `Rc` refcount header must precede the
-        // data in the same allocation, so the `String`'s buffer is not
-        // reusable. A keystroke that only re-ranks — the text unchanged
-        // since the last one — allocates nothing: `synced` compares the
-        // rope against the text the parse already holds first. Ending the
-        // copies means teaching the trait the edit event: the input knows
-        // what moved and does not hand it to the provider. Hold off until
-        // the trait offers one.
-        let sql = self.synced(text);
-        let (items, wanted) = self.items(&sql, offset);
-        self.respond(text, items, wanted, cx)
+        // Everything the answer costs — the buffer copy, the parse, the
+        // scans, the ranking — runs on the background executor, and this
+        // returns before any of it has run: the character echoes first. A
+        // request the engine replaces before its compute finishes is
+        // cancelled with the task that awaited it (`context_menu_task` is
+        // dropped per request), so no guard of this provider's own is needed
+        // to keep a superseded answer from landing. Admission — the one part
+        // that needs the app, to ask the workspace for a describe — waits for
+        // the compute on the main thread, in `respond`.
+        let provider = self.clone();
+        let rope = text.clone();
+        let compute = cx.background_spawn(async move {
+            let computed = provider.compute(&rope, offset, None);
+            (rope, computed)
+        });
+        let provider = self.clone();
+        cx.spawn(async move |cx| {
+            let (rope, computed) = compute.await;
+            Ok(cx.update(|cx| provider.respond(&rope, computed, cx)))
+        })
     }
 }
 
 impl SchemaCompletions {
-    /// The parse's handle on `text`, with the parse brought up to date: the
-    /// scans in [`Self::items`] read a parse that is current before they ask
-    /// anything of it. A buffer that moved moves its one copy in; a keystroke
-    /// that only re-ranks — the text unchanged since the last one — takes the
-    /// held text without a copy being made of it. The handle is owned so the
-    /// borrow of the parse ends before [`Self::items`] asks it again.
-    fn synced(&self, text: &Rope) -> Rc<str> {
-        let mut parsed = self.parsed.borrow_mut();
-        if parse_holds(&parsed, text) {
-            return parsed.held();
-        }
-        let sql: Rc<str> = Rc::from(text.to_string());
-        parsed.adopt(&sql);
-        sql
-    }
-
-    /// As many of `wanted`, in order, as may be asked for alongside the
-    /// fetches already in flight.
-    fn admitted(&self, mut wanted: Wanted) -> Wanted {
-        let in_flight = self
-            .columns
-            .borrow()
-            .values()
-            .filter(|state| matches!(state, ColumnState::Loading(_)))
-            .count();
-        wanted.truncate(FETCHES_IN_FLIGHT.saturating_sub(in_flight));
-        wanted
-    }
-
-    /// Ask for the columns `items` wanted, and hand its rows to the popup as
-    /// edits over `text`, the rope the ranges are offsets into.
+    /// Ask for the columns `computed` wanted, and assemble the rows the popup
+    /// shows as edits over `text`, the rope the ranges are offsets into.
+    ///
+    /// On the main thread rather than in the background compute, because the
+    /// fetch admission asks the workspace to describe — the one part of a
+    /// request that needs the app.
     fn respond(
         &self,
         text: &Rope,
-        items: Vec<(Range<usize>, Candidate)>,
-        wanted: Wanted,
+        (items, wanted): (Vec<(Range<usize>, Candidate)>, Wanted),
         cx: &mut App,
-    ) -> Task<Result<CompletionResponse>> {
+    ) -> CompletionResponse {
         // Marked before the request so a second keystroke arriving while the
-        // first fetch is in flight does not ask again.
+        // first fetch is in flight does not ask again. The compute that
+        // produced `wanted` read the cache before this ran, though, so a key
+        // already `Loading` here is a concurrent request's — skipped, or two
+        // describes would go out for one relation.
         for key in self.admitted(wanted) {
-            let before = self.columns.borrow().get(&key).cloned();
-            let attempts = match before {
-                Some(ColumnState::Failed(attempts)) => attempts,
+            let before = self
+                .columns
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&key)
+                .cloned();
+            if matches!(before, Some(ColumnState::Loading(_))) {
+                continue;
+            }
+            let attempts = match &before {
+                Some(ColumnState::Failed(attempts)) => *attempts,
                 _ => 0,
             };
             self.columns
-                .borrow_mut()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .insert(key.clone(), ColumnState::Loading(attempts));
             let asked = self.workspace.as_ref().is_some_and(|workspace| {
                 let (schema, relation) = key.clone();
@@ -1023,7 +1085,7 @@ impl SchemaCompletions {
             // A `Loading` nothing will answer would hold a place in flight
             // for the rest of the session.
             if !asked {
-                let mut columns = self.columns.borrow_mut();
+                let mut columns = self.columns.lock().unwrap_or_else(PoisonError::into_inner);
                 match before {
                     Some(state) => columns.insert(key, state),
                     None => columns.remove(&key),
@@ -1057,7 +1119,21 @@ impl SchemaCompletions {
             })
             .collect::<Vec<_>>();
 
-        Task::ready(Ok(CompletionResponse::Array(items)))
+        CompletionResponse::Array(items)
+    }
+
+    /// As many of `wanted`, in order, as may be asked for alongside the
+    /// fetches already in flight.
+    fn admitted(&self, mut wanted: Wanted) -> Wanted {
+        let in_flight = self
+            .columns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter(|state| matches!(state, ColumnState::Loading(_)))
+            .count();
+        wanted.truncate(FETCHES_IN_FLIGHT.saturating_sub(in_flight));
+        wanted
     }
 }
 
@@ -1087,8 +1163,12 @@ fn parse_holds(parse: &sql::Parse, text: &Rope) -> bool {
 /// The relation is never written into the text the scan reads: a name holding
 /// a `'`, a `--` or a space would read as a literal, a comment or two names,
 /// and silence the completion it was there to feed.
+///
+/// The schema is behind an `Arc` because the bar's heavy half runs on the
+/// background executor too, and that executor takes a `Send` future; the bar
+/// itself never crosses a thread.
 pub struct FilterCompletions {
-    schema: Rc<SchemaCompletions>,
+    schema: Arc<SchemaCompletions>,
     relation: (String, String),
     /// What the text is read behind. A MongoDB filter is a document, which
     /// the scan only reads as one inside a call.
@@ -1100,7 +1180,7 @@ impl FilterCompletions {
     /// is a `MATCH` glob over key names.
     pub fn new(
         syntax: Syntax,
-        schema: Rc<SchemaCompletions>,
+        schema: Arc<SchemaCompletions>,
         relation: (String, String),
     ) -> Option<Self> {
         let prefix = match syntax {
@@ -1116,8 +1196,11 @@ impl FilterCompletions {
         })
     }
 
-    /// [`SchemaCompletions::items`] for the bar's own text, with the ranges
-    /// back in that text.
+    /// [`SchemaCompletions::compute`] for the bar's own text, with the ranges
+    /// back in that text. The tests' way in; the trait goes through
+    /// [`CompletionProvider::completions`], which runs the same decision on
+    /// the background executor.
+    #[cfg(test)]
     fn items(&self, text: &str, offset: usize) -> (Vec<(Range<usize>, Candidate)>, Wanted) {
         let shift = self.prefix.len();
         let (items, wanted) = self.schema.items_in(
@@ -1125,20 +1208,30 @@ impl FilterCompletions {
             shift + offset,
             Some(&self.relation),
         );
-        let items = items
-            .into_iter()
-            .filter(|(word, _)| word.start >= shift)
-            // Qualifying is an editor setting, and the bar is not the editor.
-            .map(|(word, candidate)| {
-                let candidate = Candidate {
+        (bar_items(items, shift), wanted)
+    }
+}
+
+/// The computed rows back into the bar's own text: the prefixed document's
+/// ranges shifted back, and qualifying off -- an editor setting, and the bar
+/// is not the editor.
+fn bar_items(
+    items: Vec<(Range<usize>, Candidate)>,
+    shift: usize,
+) -> Vec<(Range<usize>, Candidate)> {
+    items
+        .into_iter()
+        .filter(|(word, _)| word.start >= shift)
+        .map(|(word, candidate)| {
+            (
+                word.start - shift..word.end - shift,
+                Candidate {
                     qualified: false,
                     ..candidate
-                };
-                (word.start - shift..word.end - shift, candidate)
-            })
-            .collect();
-        (items, wanted)
-    }
+                },
+            )
+        })
+        .collect()
 }
 
 impl CompletionProvider for FilterCompletions {
@@ -1155,8 +1248,27 @@ impl CompletionProvider for FilterCompletions {
         _: &mut Window,
         cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
-        let (items, wanted) = self.items(&text.to_string(), offset);
-        self.schema.respond(text, items, wanted, cx)
+        // The bar's text becomes the parse's document with the prefix in
+        // front, so the editor's own scan reads it; the ranges come back
+        // prefixed and are shifted back before the response is assembled over
+        // the bar's rope. The copy and the decision run on the background
+        // executor, as the editor's request does; admission stays on the main
+        // thread for the reason [`SchemaCompletions::respond`] gives.
+        let schema = Arc::clone(&self.schema);
+        let relation = self.relation.clone();
+        let shift = self.prefix.len();
+        let prefix = self.prefix;
+        let rope = text.clone();
+        let compute = cx.background_spawn(async move {
+            let document = Rope::from(format!("{}{}", prefix, rope));
+            let (items, wanted) = schema.compute(&document, shift + offset, Some(&relation));
+            (rope, bar_items(items, shift), wanted)
+        });
+        let schema = Arc::clone(&self.schema);
+        cx.spawn(async move |cx| {
+            let (rope, items, wanted) = compute.await;
+            Ok(cx.update(|cx| schema.respond(&rope, (items, wanted), cx)))
+        })
     }
 }
 
@@ -1323,7 +1435,7 @@ fn qualifier_before(sql: &str, word_start: usize) -> Option<&str> {
 }
 
 /// Whether nothing is typed and nothing qualifies at the caret -- where
-/// [`SchemaCompletions::items`] has no answer and returns none -- read
+/// the decision has no answer and returns none -- read
 /// straight off the rope rather than out of a copy of the buffer.
 ///
 /// The two bytes in front of the caret are the whole question: a word ends at
@@ -1817,13 +1929,13 @@ mod tests {
         SchemaCompletions {
             engine: Engine::Postgres,
             catalog: Arc::new(catalog),
-            columns: Rc::new(RefCell::new(held)),
+            columns: Arc::new(Mutex::new(held)),
             qualify: false,
             alias: false,
             workspace: None,
-            fuzzy: RefCell::new(Fuzzy::new()),
-            parsed: RefCell::new(sql::Parse::new()),
-            pool: RefCell::new(None),
+            fuzzy: Arc::new(Mutex::new(Fuzzy::new())),
+            parsed: Arc::new(Mutex::new(sql::Parse::new())),
+            pool: Arc::new(OnceLock::new()),
         }
     }
 
@@ -2032,14 +2144,14 @@ mod tests {
         // Nothing to build until a keystroke asks, and a buffer that completes
         // from mql or redis commands never asks at all.
         let completions = catalog();
-        assert!(completions.pool.borrow().is_none());
+        assert!(completions.pool.get().is_none());
         let offered = completions.items("SELECT * FROM acc", 17).0;
         assert!(
             offered
                 .iter()
                 .any(|(_, candidate)| candidate.label == "accounts")
         );
-        assert!(completions.pool.borrow().is_some());
+        assert!(completions.pool.get().is_some());
     }
 
     #[test]
@@ -2327,10 +2439,14 @@ mod tests {
 
         // What the provider does on a miss, so the second keystroke asks for
         // nothing while the first fetch is still out.
-        completions.columns.borrow_mut().insert(
-            ("public".to_string(), "accounts".to_string()),
-            ColumnState::Loading(0),
-        );
+        completions
+            .columns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                ("public".to_string(), "accounts".to_string()),
+                ColumnState::Loading(0),
+            );
         assert!(completions.items(sql, sql.len()).1.is_empty());
     }
 
@@ -2357,7 +2473,8 @@ mod tests {
 
         completions
             .columns
-            .borrow_mut()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(first[0].clone(), ColumnState::Loading(0));
         assert_eq!(
             completions.admitted(wanted.clone()).len(),
@@ -2366,7 +2483,8 @@ mod tests {
         for key in &first {
             completions
                 .columns
-                .borrow_mut()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .insert(key.clone(), ColumnState::Loading(0));
         }
         assert!(completions.admitted(wanted).is_empty());
@@ -2384,10 +2502,14 @@ mod tests {
     #[test]
     fn a_relation_the_server_would_not_describe_is_not_asked_again() {
         let completions = detached(schemas(), &[]);
-        completions.columns.borrow_mut().insert(
-            ("public".to_string(), "accounts".to_string()),
-            ColumnState::Failed(FETCH_ATTEMPTS),
-        );
+        completions
+            .columns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                ("public".to_string(), "accounts".to_string()),
+                ColumnState::Failed(FETCH_ATTEMPTS),
+            );
         let sql = "SELECT accounts.";
         assert!(completions.items(sql, sql.len()).1.is_empty());
     }
@@ -2404,7 +2526,8 @@ mod tests {
         for attempts in 0..FETCH_ATTEMPTS {
             completions
                 .columns
-                .borrow_mut()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .insert(key.clone(), ColumnState::Failed(attempts));
             assert_eq!(
                 completions.items(sql, sql.len()).1,
@@ -2582,7 +2705,7 @@ mod tests {
         );
         schema.engine = engine;
         let scope = ("public".to_string(), name.to_string());
-        FilterCompletions::new(engine.syntax(), Rc::new(schema), scope)
+        FilterCompletions::new(engine.syntax(), Arc::new(schema), scope)
             .expect("the engine completes a raw filter")
             .items(&text, offset)
             .0
@@ -2635,7 +2758,7 @@ mod tests {
         let filter = |held: &[(&str, &str, &[&str])]| {
             FilterCompletions::new(
                 Syntax::Sql,
-                Rc::new(detached(catalog.clone(), held)),
+                Arc::new(detached(catalog.clone(), held)),
                 scope.clone(),
             )
             .expect("SQL completes a raw filter")
@@ -2684,7 +2807,7 @@ mod tests {
     #[test]
     fn a_redis_raw_filter_completes_nothing() {
         let scope = ("0".to_string(), "keys".to_string());
-        assert!(FilterCompletions::new(Syntax::Redis, Rc::new(catalog()), scope).is_none());
+        assert!(FilterCompletions::new(Syntax::Redis, Arc::new(catalog()), scope).is_none());
     }
 
     #[test]
@@ -2777,7 +2900,7 @@ mod tests {
             })
             .collect();
         SchemaCompletions {
-            columns: Rc::new(RefCell::new(held)),
+            columns: Arc::new(Mutex::new(held)),
             alias: true,
             ..detached(catalog, &[])
         }
@@ -3024,9 +3147,95 @@ mod tests {
     #[test]
     fn a_filter_bar_writes_no_alias() {
         let scope = ("public".to_string(), "orders".to_string());
-        let bar = FilterCompletions::new(Syntax::Sql, Rc::new(shop()), scope).unwrap();
+        let bar = FilterCompletions::new(Syntax::Sql, Arc::new(shop()), scope).unwrap();
         let text = "id IN (SELECT id FROM cust";
         let (items, _) = bar.items(text, text.len());
         assert_eq!(items[0].1.written(Engine::Postgres), "customers");
+    }
+
+    /// A window with nothing in it, for the one test that must hand the
+    /// provider a real `Window` without dragging the workspace up.
+    struct Bare;
+
+    impl gpui::Render for Bare {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    #[gpui::test]
+    fn a_request_runs_its_work_off_the_calling_thread(cx: &mut gpui::TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+
+        use lsp_types::CompletionTriggerKind;
+
+        let completions = Arc::new(catalog());
+        let sql = "SELECT * FROM acc";
+        let rope = Rope::from(sql);
+
+        let (_, visual) = cx.add_window_view(|_, _| Bare);
+        let response = visual.update(|window, cx| {
+            let request = completions.completions(
+                &rope,
+                sql.len(),
+                CompletionContext {
+                    trigger_kind: CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                },
+                window,
+                cx,
+            );
+            // The call has returned and the parse has not seen the buffer it
+            // is about to rank from. The test scheduler runs background tasks
+            // only on a drain, so nothing of the compute can have started
+            // yet: this pins the work sitting behind a spawn rather than on
+            // the calling thread, where the keystroke would wait for it.
+            assert!(
+                completions
+                    .parsed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .held()
+                    .is_empty()
+            );
+            // Held past this scope, since dropping the request would cancel
+            // the compute behind it; a witness on the foreground executor
+            // awaits the response the way the editor does.
+            let seen = Rc::new(RefCell::new(None));
+            let witness = seen.clone();
+            cx.spawn(async move |_| {
+                *witness.borrow_mut() = request.await.ok();
+            })
+            .detach();
+            seen
+        });
+
+        cx.run_until_parked();
+
+        // The compute ran, off the calling thread, and delivered the response
+        // through it -- the same leading row the direct decision (`items`)
+        // gives.
+        assert_eq!(
+            completions
+                .parsed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .held()
+                .as_ref(),
+            sql
+        );
+        let response = response.borrow();
+        let response = response.as_ref().expect("the response landed");
+        let CompletionResponse::Array(items) = response else {
+            unreachable!("the provider answers with an array");
+        };
+        assert_eq!(
+            items.first().expect("accounts was offered").label,
+            "accounts"
+        );
     }
 }

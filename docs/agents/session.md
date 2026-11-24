@@ -1155,6 +1155,18 @@ keywords that carry a statement's shape, and the dialect's built-in functions
 and values. It is a `CompletionProvider` implementation and nothing else: the
 popup, its scroll and its keys all belong to gpui-component.
 
+The decision runs off the keystroke thread. The engine calls the provider
+inside the keystroke's own input handling, so a synchronous answer delays
+every character echo — the provider therefore returns a task whose compute
+(the buffer copy, the incremental parse, the suppression scan, the ranking)
+runs on the background executor, while the main thread keeps the O(1)
+`nothing_typed` probe, the rope clone, and the fetch admission, which needs
+the `App`. A superseded request is not ignored but cancelled: the engine
+replaces its task per keystroke and dropping a gpui task cancels its future,
+which is why there is no generation counter. The parse state is shared behind
+a mutex precisely so the incremental state survives the hop between threads
+and between the editor and the filter bar.
+
 The built-ins are data, one table per dialect under `src/db/builtins/` read
 through `Engine::builtins`, offered wherever keywords are and never where a
 relation belongs; a keyword spelled like one is offered once, as the built-in,

@@ -15,7 +15,7 @@
 
 use std::borrow::Cow;
 use std::ops::{ControlFlow, Range};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use serde::Deserialize;
 // Aliased: `tree_sitter::Parser` already owns the name `Parser` in this file,
@@ -154,18 +154,20 @@ impl Buffer {
 ///
 /// Scoped to the completion provider, and about boundaries only: nothing
 /// reads a statement's meaning off it. The editor and the filter bar drive
-/// the same provider, so a switch between them reparses whole once.
+/// the same provider, so a switch between them reparses whole once. Behind a
+/// `Mutex` in the provider, whose heavy half -- this sync included -- runs on
+/// the background executor, so it is `Arc<str>` and `Send` rather than `Rc`.
 pub(crate) struct Parse {
     /// The text `tree` was parsed from, shared with the caller that handed
-    /// it over. A changed keystroke copies the buffer twice — rope to
-    /// `String`, then `String` into this `Rc<str>` — where stable Rust
+    /// it over. A keystroke that moved the text is copied twice — rope to
+    /// `String`, then `String` into this `Arc<str>` — where stable Rust
     /// cannot fold them into one; see the ponytail in
-    /// `SchemaCompletions::completions` for the full story. A keystroke
-    /// whose text is unchanged allocates nothing — the caller compares the
-    /// rope against what is held here first and takes this `Rc` back.
-    /// Ending the copies on the changed path means the trait delivering the
-    /// edit event. Compared against the buffer to find what moved.
-    text: Rc<str>,
+    /// `SchemaCompletions::compute` for the full story. Both copies are paid
+    /// on the background executor since that compute left the keystroke's
+    /// thread. A keystroke whose text is unchanged allocates nothing — the
+    /// caller compares the rope against what is held here first and takes
+    /// this `Arc` back. Compared against the buffer to find what moved.
+    text: Arc<str>,
     parser: Parser,
     tree: Option<Tree>,
     buffer: Buffer,
@@ -207,7 +209,7 @@ impl Parse {
             .set_language(&tree_sitter_sequel::LANGUAGE.into())
             .ok();
         Self {
-            text: Rc::from(String::new()),
+            text: Arc::from(String::new()),
             parser,
             tree: None,
             buffer: Buffer {
@@ -223,8 +225,8 @@ impl Parse {
     /// A handle on the text the parse holds. A caller reads the buffer
     /// through this — the same allocation the parse holds — rather than
     /// through a copy of it.
-    pub(crate) fn held(&self) -> Rc<str> {
-        Rc::clone(&self.text)
+    pub(crate) fn held(&self) -> Arc<str> {
+        Arc::clone(&self.text)
     }
 
     /// The statement `offset` sits in, after bringing the parse up to `sql`.
@@ -233,22 +235,22 @@ impl Parse {
     pub(crate) fn statement_at(&mut self, sql: &str, offset: usize) -> Option<Range<usize>> {
         if *self.text != *sql {
             self.refresh(sql);
-            self.text = Rc::from(sql);
+            self.text = Arc::from(sql);
         }
         self.buffer.statement_at(offset)
     }
 
     /// Take `sql` over as the parsed text, reparsing from the edit. For a
     /// caller that has already proved the buffer moved and paid for the
-    /// text: this copies nothing further, the `Rc` it is handed is what the
-    /// parse holds — but that `Rc` is itself the second buffer copy (why
+    /// text: this copies nothing further, the `Arc` it is handed is what the
+    /// parse holds — but that `Arc` is itself the second buffer copy (why
     /// stable Rust cannot fold it into one: see the ponytail in
-    /// `SchemaCompletions::completions`). An unchanged keystroke never
+    /// `SchemaCompletions::compute`). An unchanged keystroke never
     /// reaches here, and ending the copies means the trait delivering the
     /// edit event.
-    pub(crate) fn adopt(&mut self, sql: &Rc<str>) {
+    pub(crate) fn adopt(&mut self, sql: &Arc<str>) {
         self.refresh(sql);
-        self.text = Rc::clone(sql);
+        self.text = Arc::clone(sql);
     }
 
     /// Whether `at` falls inside a string literal or a comment, on a parse

@@ -18,6 +18,7 @@ use crate::sql::{Destructive, Mode};
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::PoisonError;
 
 /// How long [`Workspace::remember_profiles_soon`] waits after the last change.
 const PROFILES_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -2894,7 +2895,7 @@ impl Workspace {
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
             workspace
-                .update(cx, |workspace, cx| {
+                .update(cx, |workspace, _cx| {
                     // A reconnect clears the cache and starts a new generation,
                     // so a result from the old one describes a database this
                     // profile is no longer talking to.
@@ -2907,15 +2908,26 @@ impl Workspace {
                         // The attempt count rides on the `Loading` the request
                         // wrote, so a relation that keeps failing runs out.
                         Err(_) => {
-                            let attempts = match columns.borrow().get(&key) {
+                            let attempts = match columns
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .get(&key)
+                            {
                                 Some(completion::ColumnState::Loading(attempts)) => *attempts,
                                 _ => 0,
                             };
                             completion::ColumnState::Failed(attempts.saturating_add(1))
                         }
                     };
-                    columns.borrow_mut().insert(key, state);
-                    cx.notify();
+                    columns
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(key, state);
+                    // Not `cx.notify()`: nothing draws the cache, and the popup
+                    // does not reopen on a fetch landing by design -- the next
+                    // keystroke offers the columns. Notifying here re-rendered
+                    // the whole workspace, results pane included, on a frame
+                    // the user was typing through.
                 })
                 .ok();
         })
@@ -2928,8 +2940,8 @@ impl Workspace {
             return;
         };
         let engine = profile.config.engine();
-        profile.session.completions = match &profile.catalog {
-            CatalogState::Loaded(catalog, _) => Some(Rc::new(SchemaCompletions::new(
+        let completions = match &profile.catalog {
+            CatalogState::Loaded(catalog, _) => Some(Arc::new(SchemaCompletions::new(
                 engine,
                 Arc::new(catalog.clone()),
                 profile.session.completion_columns.clone(),
@@ -2939,11 +2951,16 @@ impl Workspace {
             ))),
             _ => None,
         };
+        // The editors hold the provider behind the engine's own
+        // `Rc<dyn CompletionProvider>` and the filter bars hold the `Arc`,
+        // which is what can cross to the background executor. The clone
+        // shares every cache, so both spell from one parse.
+        let provider = completions
+            .as_ref()
+            .map(|completions| Rc::new((**completions).clone()) as Rc<dyn CompletionProvider>);
+        profile.session.completions = completions;
+
         let session = &profile.session;
-        let provider = session
-            .completions
-            .clone()
-            .map(|provider| provider as Rc<dyn CompletionProvider>);
 
         // Every buffer, not just the one in front: a tab switch must not be a
         // moment where completion quietly stops working.
